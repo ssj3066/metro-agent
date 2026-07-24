@@ -63,6 +63,11 @@ install -m 755 "${SCRIPT_DIR}/nms-collector.js" "${INSTALL_DIR}/nms-collector.js
 install -m 755 "${SCRIPT_DIR}/nms-packet-capture.sh" "${INSTALL_DIR}/nms-packet-capture.sh"
 install -m 755 "${SCRIPT_DIR}/nms-gui-operations.sh" "${INSTALL_DIR}/nms-gui-operations.sh"
 install -m 755 "${SCRIPT_DIR}/nms-wireless-scan.py" "${INSTALL_DIR}/nms-wireless-scan.py"
+install -d -m 755 "${INSTALL_DIR}/metro-agent-v1/lib" "${INSTALL_DIR}/metro-agent-v1/plugins"
+install -m 755 "${SCRIPT_DIR}/metro-agent-v1/index.js" "${INSTALL_DIR}/metro-agent-v1/index.js"
+install -m 644 "${SCRIPT_DIR}/metro-agent-v1/lib/queue.js" "${INSTALL_DIR}/metro-agent-v1/lib/queue.js"
+install -m 644 "${SCRIPT_DIR}/metro-agent-v1/lib/transport.js" "${INSTALL_DIR}/metro-agent-v1/lib/transport.js"
+install -m 644 "${SCRIPT_DIR}/metro-agent-v1/plugins/"*.js "${INSTALL_DIR}/metro-agent-v1/plugins/"
 install -m 755 "${SCRIPT_DIR}/summarize-syn-sources.sh" "${INSTALL_DIR}/summarize-syn-sources.sh"
 install -m 755 "${SCRIPT_DIR}/heartbeat.sh" "${INSTALL_DIR}/heartbeat.sh"
 install -m 755 "${SCRIPT_DIR}/ensure-collector-autostart.sh" "${INSTALL_DIR}/ensure-collector-autostart.sh"
@@ -113,6 +118,9 @@ install -m 644 "${SCRIPT_DIR}/systemd/nms-collector-diagnostic-worker.service" "
 install -m 644 "${SCRIPT_DIR}/systemd/nms-collector-edge-analysis.service" "${SYSTEMD_DIR}/nms-collector-edge-analysis.service"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-collector-edge-analysis.timer" "${SYSTEMD_DIR}/nms-collector-edge-analysis.timer"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-iperf3-server.service" "${SYSTEMD_DIR}/nms-iperf3-server.service"
+install -m 644 "${SCRIPT_DIR}/systemd/nms-metro-agent-v1.service" "${SYSTEMD_DIR}/nms-metro-agent-v1.service"
+install -m 644 "${SCRIPT_DIR}/systemd/nms-metro-agent-v1.timer" "${SYSTEMD_DIR}/nms-metro-agent-v1.timer"
+install -d -m 700 /var/lib/nms-collector/metro-agent-v1 /var/lib/nms-collector/metro-agent-v1/queue
 install -d -m 755 /etc/NetworkManager/dispatcher.d
 install -m 755 "${SCRIPT_DIR}/nms-collector-network-change.sh" "/etc/NetworkManager/dispatcher.d/90-nms-collector-network-change"
 systemctl daemon-reload
@@ -191,6 +199,18 @@ else
   systemctl disable --now nms-collector-edge-analysis.timer nms-collector-edge-analysis.service 2>/dev/null || true
 fi
 
+if grep -q '^METRO_AGENT_V1_ENABLED=true' "${ENV_DIR}/collector.env"; then
+  if [[ "$COLLECTOR_READY" == "true" ]]; then
+    systemctl enable --now nms-metro-agent-v1.timer
+    systemctl start nms-metro-agent-v1.service || true
+  else
+    systemctl disable --now nms-metro-agent-v1.timer nms-metro-agent-v1.service 2>/dev/null || true
+    echo "Metro Agent V1 kept disabled until nms-collector doctor passes"
+  fi
+else
+  systemctl disable --now nms-metro-agent-v1.timer nms-metro-agent-v1.service 2>/dev/null || true
+fi
+
 # The autostart service owns boot recovery. It is independent of the desktop
 # GUI and is safe to run even when the current network cannot reach NMS yet.
 systemctl start nms-collector-autostart.service || true
@@ -203,3 +223,4 @@ echo "check: systemctl status nms-collector-heartbeat.timer"
 echo "autostart: systemctl status nms-collector-autostart.service"
 echo "diagnostics: systemctl status nms-collector-diagnostic-worker.service"
 echo "edge analysis: systemctl status nms-collector-edge-analysis.timer"
+echo "Metro Agent V1: systemctl status nms-metro-agent-v1.timer"

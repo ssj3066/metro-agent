@@ -25,6 +25,9 @@
 - `systemd/nms-collector-diagnostic-worker.service`
 - `systemd/nms-collector-edge-analysis.service`
 - `systemd/nms-collector-edge-analysis.timer`
+- `metro-agent-v1/` (중앙 설정 기반 Ping/TCP/HTTP/System 실행 계층)
+- `systemd/nms-metro-agent-v1.service`
+- `systemd/nms-metro-agent-v1.timer`
 - `rsyslog/49-nms-relay.conf`
 
 역할 정의:
@@ -110,6 +113,39 @@ curl -X POST "${NMS_BASE_URL}/api/collectors" \
 `nms-collector.js`는 `heartbeat`, `trap-forwarder`, `diagnostic-worker`, `diagnostic-once`, `edge-analysis`, `edge-analysis-heartbeat`, `doctor`, `render-rsyslog-config` 서브커맨드를 한 런타임에서 제공합니다. 설치 스크립트도 이 런타임을 사용해 env를 검증하고 rsyslog relay 설정을 생성합니다.
 
 systemd 타이머는 기본 60초 주기로 heartbeat를 전송합니다. Desktop GUI를 열지 않아도 부팅 후 `network-online.target`에서 `nms-collector-autostart.service`가 heartbeat, 원격진단, edge 분석을 준비합니다. NetworkManager가 DHCP 주소를 새로 받거나 링크가 복구되면 dispatcher가 즉시 heartbeat와 edge 분석을 한 번 실행합니다. WireGuard는 원격 접속용 선택 기능이며, VPN 상태와 무관하게 중앙 NMS HTTPS 전송은 계속 시도합니다.
+
+## Metro Agent V1
+
+`Metro Agent V1`은 기존 heartbeat, 원격진단, Wi-Fi/RF 수집기를 대체하지
+않는 별도 실행 계층입니다. 기존 `COLLECTOR_ID`, `COLLECTOR_TOKEN`,
+`NMS_URL`을 그대로 사용하며 33번 중앙 NMS에서 배포한 점검 프로필에
+따라 `ping`, `tcp`, `http`, `system` 플러그인을 실행합니다.
+
+```env
+METRO_AGENT_V1_ENABLED=true
+METRO_AGENT_V1_STATE_DIR=/var/lib/nms-collector/metro-agent-v1
+```
+
+중앙 API는 다음 계약을 사용합니다.
+
+- `GET /api/collectors/:id/metro-agent/config`
+- `POST /api/collectors/:id/metro-agent/check-batches`
+
+실패한 배치는 `METRO_AGENT_V1_STATE_DIR/queue`에 권한 `0600`으로
+저장하고 다음 실행 때 순서대로 재전송합니다. `batch_id`는 중앙 DB의
+고유 키이므로 응답 유실 후 같은 배치를 재전송해도 중복 저장되지
+않습니다. 마지막 정상 설정은 로컬에 캐시하므로 현장 인터넷이 끊겨도
+수집은 계속할 수 있습니다.
+
+```bash
+sudo systemctl status nms-metro-agent-v1.timer
+sudo ENV_FILE=/etc/nms-collector/collector.env \
+  node /opt/nms-collector/metro-agent-v1/index.js doctor
+sudo ENV_FILE=/etc/nms-collector/collector.env \
+  node /opt/nms-collector/metro-agent-v1/index.js run-once --force
+sudo ENV_FILE=/etc/nms-collector/collector.env \
+  node /opt/nms-collector/metro-agent-v1/index.js queue-status
+```
 
 이미 설치된 수집기에 이 자동 복구 구성만 추가할 때는 패키지 안에서 `sudo bash apply-collector-autostart-recovery.sh`를 실행합니다. 이동형/DHCP 수집기에 이전 사설 IP가 남아 있으면 `sudo bash apply-collector-autostart-recovery.sh --clear-private-ip`를 실행합니다. 이 옵션은 collector.env를 timestamp 백업한 뒤 `COLLECTOR_PRIVATE_IP` 고정값만 비우며 token은 변경하지 않습니다.
 

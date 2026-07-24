@@ -54,3 +54,7 @@ Wi-Fi 품질 분석 1차 개발 범위는
 [docs/WIFI_ANALYSIS_PHASE1_PLAN.md](docs/WIFI_ANALYSIS_PHASE1_PLAN.md)를
 기준으로 진행합니다.
 
+기존 33 NMS와 130 수집기를 유지하면서 추가하는 Metro Agent 실행
+계층과 중앙 API 계약은
+[docs/METRO_AGENT_PLATFORM_V1.md](docs/METRO_AGENT_PLATFORM_V1.md)를
+기준으로 합니다.

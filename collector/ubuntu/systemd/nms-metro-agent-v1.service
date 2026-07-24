@@ -1,0 +1,18 @@
+[Unit]
+Description=Metro Agent V1 field checks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/nms-collector/collector.env
+Environment=ENV_FILE=/etc/nms-collector/collector.env
+WorkingDirectory=/opt/nms-collector/metro-agent-v1
+ExecStart=/usr/local/bin/node /opt/nms-collector/metro-agent-v1/index.js run-once
+TimeoutStartSec=120
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nms-collector/metro-agent-v1
