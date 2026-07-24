@@ -1,0 +1,17 @@
+[Unit]
+Description=Arm NMS Collector Services After Network Is Ready
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+Environment=ENV_FILE=/etc/nms-collector/collector.env
+ExecStart=/opt/nms-collector/ensure-collector-autostart.sh
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=60
+User=root
+
+[Install]
+WantedBy=multi-user.target

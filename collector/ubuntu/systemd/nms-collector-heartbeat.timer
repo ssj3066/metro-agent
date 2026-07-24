@@ -1,0 +1,12 @@
+[Unit]
+Description=Run NMS Collector Heartbeat every minute
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=60s
+AccuracySec=10s
+Unit=nms-collector-heartbeat.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=NMS Collector Edge Analysis
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/nms-collector/collector.env
+Environment=ENV_FILE=/etc/nms-collector/collector.env
+WorkingDirectory=/opt/nms-collector
+ExecStart=/usr/local/bin/node /opt/nms-collector/nms-collector.js edge-analysis-heartbeat
+User=root

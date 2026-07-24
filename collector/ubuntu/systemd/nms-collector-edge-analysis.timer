@@ -1,0 +1,12 @@
+[Unit]
+Description=Run NMS Collector Edge Analysis every 10 minutes
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=10m
+AccuracySec=30s
+Unit=nms-collector-edge-analysis.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+*.pcap
+*.pcapng
+*.bak
+*.tmp
+.env
+collector.env
+dist/
+build/
+backups/
+

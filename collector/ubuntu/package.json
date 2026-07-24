@@ -1,0 +1,10 @@
+{
+  "name": "nms-collector-ubuntu",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ubuntu collector runtime for heartbeat, doctor, and SNMP trap forwarding",
+  "main": "nms-collector.js",
+  "dependencies": {
+    "net-snmp": "^3.26.1"
+  }
+}

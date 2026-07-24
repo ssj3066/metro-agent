@@ -1,0 +1,15 @@
+{
+  "name": "metro-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "METRO field network collector and diagnostic agent",
+  "scripts": {
+    "test:node": "node --test test/*.test.js",
+    "test:python": "python3 -m unittest discover -s test -p '*_test.py'",
+    "test": "npm run test:node && npm run test:python",
+    "doctor": "node collector/ubuntu/nms-collector.js doctor"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,170 @@
+from pathlib import Path
+
+content = """130 분석 서버 Wi-Fi 품질 분석 기능 개발 지시서
+
+1. 최종 목표
+
+현재 개발 중인 130 분석 서버에 Wi-Fi 품질 분석 기능을 추가한다.
+
+Omada 컨트롤러 데이터, 유선·무선 네트워크 측정값, Wi-Fi 프로토콜 정보,
+tinySA Ultra+ 스펙트럼 데이터를 동일 시간축으로 결합하여
+간헐적인 지연·끊김 원인을 다음 항목으로 분류한다.
+
+- 상위 유선망 또는 인터넷 회선 문제
+- AP 또는 AP uplink 문제
+- AP 부하 및 airtime 포화
+- 동일·인접 채널 혼잡
+- 비-Wi-Fi RF 간섭
+- 로밍·인증 문제
+- 커버리지 경계 및 신호 약화
+
+2. 장비별 역할
+
+- 유선 인터페이스
+  - 게이트웨이, 내부 서버, 외부 IP Ping
+  - DNS 응답시간
+  - 유선망 지연 및 패킷 손실 확인
+
+- Wi-Fi 어댑터
+  - SSID, BSSID
+  - 채널, 주파수, 채널 폭
+  - RSSI, SNR
+  - TX/RX 링크속도
+  - Retry, Deauth, Disassoc
+  - 로밍 및 BSSID 변경 정보
+
+- Omada
+  - AP CPU, 메모리
+  - AP별 클라이언트 수
+  - 채널 이용률
+  - AP 트래픽
+  - 채널 변경
+  - DFS 이벤트
+  - 재부팅, uplink, 연결 해제 등 이벤트
+
+- tinySA Ultra+
+  - USB 직렬 연결
+  - 2.4GHz, 5GHz, 6GHz RF 스윕
+  - 비-Wi-Fi 간섭, 실제 RF 에너지, 순간 펄스, 연속파 분석
+
+3. tinySA 저장 항목
+
+- timestamp
+- sensor_id
+- band
+- start_hz
+- stop_hz
+- rbw_hz
+- attenuation_db
+- lna_enabled
+- antenna_profile
+- frequency_hz 배열
+- power_dbm 배열
+- 채널별 peak_dbm
+- average_dbm
+- noise_floor_dbm
+- occupied_bandwidth
+- rf_occupancy
+- pulse_detected
+- continuous_wave_detected
+
+4. 수집 주기
+
+- 유선·무선 Ping: 1초
+- Wi-Fi 상태: 5초
+- Omada 상태: 10~30초
+- tinySA 스윕: 가능한 범위에서 1~3초
+
+모든 장비는 동일한 NTP 시간 기준을 사용한다.
+
+5. 장애 캡처 방식
+
+- 최근 15분 데이터를 순환 버퍼로 유지
+- 장애 감지 시 장애 전 5분, 장애 후 5분을 영구 저장
+
+장애 감지 조건:
+- Ping 연속 손실
+- Ping 200ms 이상 지연
+- RSSI 급락
+- BSSID 변경
+- Retry 급증
+- 채널 이용률 급증
+- AP CPU 또는 클라이언트 부하 증가
+- tinySA RF 에너지 급증
+
+6. 기본 판정 규칙
+
+- 유선과 무선이 동시에 이상
+  → 상위망, 게이트웨이, 회선 또는 공통 구간 문제
+
+- 유선 정상, 무선과 AP 관리 Ping이 함께 이상
+  → AP 또는 AP uplink 문제
+
+- 유선 정상, AP 상태 정상, Retry와 RF 에너지가 함께 증가
+  → RF 간섭 가능성
+
+- Wi-Fi 프레임 활동은 적지만 tinySA RF 에너지가 높음
+  → 비-Wi-Fi 간섭 가능성
+
+- RF 변화 없이 BSSID 변경, Deauth, 재연결 발생
+  → 로밍 또는 인증 문제
+
+- AP 클라이언트 수, airtime, CPU, 채널 이용률 증가
+  → AP 부하 또는 airtime 포화
+
+- RSSI와 SNR만 낮고 혼잡과 간섭은 적음
+  → 커버리지 경계 또는 음영 문제
+
+7. 중요 원칙
+
+- tinySA dBm과 Wi-Fi RSSI를 동일한 절대값으로 취급하지 않는다.
+- tinySA는 RF 물리계층 보조 센서로 사용한다.
+- Wi-Fi 어댑터는 802.11 프로토콜 계층을 담당한다.
+- Omada는 AP 운영 상태와 부하 정보를 담당한다.
+- 휴대전화 Wi-Fi 분석기는 빠른 현장 확인용으로만 사용한다.
+- 고객의 체감 시간이나 진술만으로 원인을 단정하지 않는다.
+- 유선, 무선, AP 부하, RF 데이터를 같은 시간축으로 비교한다.
+
+8. 1차 구현 범위
+
+기존 프로젝트 구조를 먼저 조사한 뒤 다음 기능만 우선 구현한다.
+
+1) 유선·무선 동시 Ping 수집
+2) Wi-Fi RSSI, BSSID, 채널 수집
+3) tinySA USB 연결 및 단일 대역 스윕 수집
+4) Omada AP 상태 수집 가능 여부 조사
+5) 기존 DB에 시계열 저장
+6) 기존 웹 대시보드에 동일 시간축 그래프 추가
+7) 기본 장애 이벤트 생성
+8) 기존 기능을 깨뜨리지 않는 테스트 작성
+
+9. 개발 진행 방식
+
+- 새 프레임워크나 데이터베이스를 임의로 추가하지 않는다.
+- 현재 프로젝트의 기술 스택과 구조를 최대한 재사용한다.
+- 실제 코드 수정 전에 다음을 먼저 조사한다.
+  - 저장소 구조
+  - 실행 방식
+  - DB 스키마
+  - 기존 수집기
+  - 기존 대시보드
+  - 배포 방식
+- 조사 후 다음 내용을 먼저 제시하고 승인을 기다린다.
+  - 구현 계획
+  - 수정 예정 파일 목록
+  - DB 변경안
+  - API 변경안
+  - 테스트 계획
+  - 위험요소와 롤백 방법
+
+10. 코덱스 실행 지시
+
+이 문서를 읽고 바로 전체 기능을 한 번에 구현하지 말고,
+먼저 기존 프로젝트를 분석한 후 1차 구현 계획을 작성하라.
+
+계획 승인 전에는 대규모 구조 변경이나 데이터베이스 교체를 하지 말라.
+"""
+
+path = Path("/mnt/data/130_server_wifi_analysis_codex_prompt.txt")
+path.write_text(content, encoding="utf-8")
+print(path)

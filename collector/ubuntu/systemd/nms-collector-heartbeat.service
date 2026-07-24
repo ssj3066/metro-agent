@@ -1,0 +1,13 @@
+[Unit]
+Description=NMS Collector Heartbeat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/nms-collector/collector.env
+Environment=ENV_FILE=/etc/nms-collector/collector.env
+WorkingDirectory=/opt/nms-collector
+TimeoutStartSec=45
+ExecStart=/usr/local/bin/node /opt/nms-collector/nms-collector.js heartbeat
+User=root

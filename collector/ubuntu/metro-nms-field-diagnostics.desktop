@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=METRO NMS Field Diagnostics
+Comment=현장 네트워크 유지보수 진단
+Exec=/usr/local/bin/metro-nms-field-diagnostics
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Network;System;
