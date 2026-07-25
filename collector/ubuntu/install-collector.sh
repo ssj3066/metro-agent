@@ -50,19 +50,26 @@ fi
 
 echo "[1/8] installing base packages, supported Node.js, and field diagnostics"
 apt-get update
-apt-get install -y ca-certificates curl jq rsyslog snmp xz-utils iproute2 iputils-ping traceroute dnsutils netcat-openbsd tcpdump
+apt-get install -y ca-certificates curl jq rsyslog snmp xz-utils iproute2 iputils-ping traceroute dnsutils netcat-openbsd tcpdump python3-serial
 bash "${SCRIPT_DIR}/install-node-lts.sh"
 SKIP_APT_UPDATE=true bash "${SCRIPT_DIR}/install-field-tools.sh"
 
 echo "[2/8] creating directories"
 install -d -m 755 "$INSTALL_DIR"
 install -d -m 755 "$ENV_DIR"
+install -d -m 755 "/etc/udev/rules.d"
 
 echo "[3/8] installing collector runtime"
 install -m 755 "${SCRIPT_DIR}/nms-collector.js" "${INSTALL_DIR}/nms-collector.js"
 install -m 755 "${SCRIPT_DIR}/nms-packet-capture.sh" "${INSTALL_DIR}/nms-packet-capture.sh"
 install -m 755 "${SCRIPT_DIR}/nms-gui-operations.sh" "${INSTALL_DIR}/nms-gui-operations.sh"
 install -m 755 "${SCRIPT_DIR}/nms-wireless-scan.py" "${INSTALL_DIR}/nms-wireless-scan.py"
+install -m 755 "${SCRIPT_DIR}/install-wireless-adapter-support.sh" "${INSTALL_DIR}/install-wireless-adapter-support.sh"
+install -m 755 "${SCRIPT_DIR}/nms-wifi-analysis.js" "${INSTALL_DIR}/nms-wifi-analysis.js"
+install -m 755 "${SCRIPT_DIR}/nms-measurement-session.js" "${INSTALL_DIR}/nms-measurement-session.js"
+install -m 755 "${SCRIPT_DIR}/measurement-session-control.sh" "${INSTALL_DIR}/measurement-session-control.sh"
+install -m 755 "${SCRIPT_DIR}/nms-tinysa-sweep.py" "${INSTALL_DIR}/nms-tinysa-sweep.py"
+install -m 755 "${SCRIPT_DIR}/configure-tinysa.sh" "${INSTALL_DIR}/configure-tinysa.sh"
 install -d -m 755 "${INSTALL_DIR}/metro-agent-v1/lib" "${INSTALL_DIR}/metro-agent-v1/plugins"
 install -m 755 "${SCRIPT_DIR}/metro-agent-v1/index.js" "${INSTALL_DIR}/metro-agent-v1/index.js"
 install -m 644 "${SCRIPT_DIR}/metro-agent-v1/lib/queue.js" "${INSTALL_DIR}/metro-agent-v1/lib/queue.js"
@@ -75,9 +82,29 @@ install -m 755 "${SCRIPT_DIR}/trap-forwarder.js" "${INSTALL_DIR}/trap-forwarder.
 install -m 755 "${SCRIPT_DIR}/configure-snmp-agent.sh" "${INSTALL_DIR}/configure-snmp-agent.sh"
 install -m 755 "${SCRIPT_DIR}/configure-snmp-targets.sh" "${INSTALL_DIR}/configure-snmp-targets.sh"
 install -m 755 "${SCRIPT_DIR}/nms-field-diagnostics.py" "/usr/local/bin/metro-nms-field-diagnostics"
+install -m 755 "${SCRIPT_DIR}/nms_packet_flood.py" "/usr/local/bin/nms_packet_flood.py"
 install -d -m 755 "/usr/local/lib/metro-nms-collector"
 install -m 644 "${SCRIPT_DIR}/ict_field_client.py" "/usr/local/lib/metro-nms-collector/ict_field_client.py"
 install -m 644 "${SCRIPT_DIR}/metro-nms-field-diagnostics.desktop" "/usr/share/applications/metro-nms-field-diagnostics.desktop"
+install -m 440 "${SCRIPT_DIR}/sudoers/metro-tinysa" "/etc/sudoers.d/metro-tinysa"
+visudo -cf "/etc/sudoers.d/metro-tinysa"
+rm -f "/etc/sudoers.d/metro-measurement-status"
+install -m 440 \
+  "${SCRIPT_DIR}/sudoers/metro-measurement-control" \
+  "/etc/sudoers.d/metro-measurement-control"
+visudo -cf "/etc/sudoers.d/metro-measurement-control"
+install -m 644 "${SCRIPT_DIR}/udev/70-metro-tinysa.rules" "/etc/udev/rules.d/70-metro-tinysa.rules"
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=tty
+
+GUI_USER="${NMS_GUI_USER:-${SUDO_USER:-}}"
+if [[ -z "$GUI_USER" ]] && id metro-agent >/dev/null 2>&1; then
+  GUI_USER="metro-agent"
+fi
+if [[ -n "$GUI_USER" && "$GUI_USER" != "root" ]] && id "$GUI_USER" >/dev/null 2>&1; then
+  usermod -aG dialout "$GUI_USER"
+  echo "tinySA access enabled for ${GUI_USER}; an existing desktop login must sign out once to refresh groups"
+fi
 install -m 644 "${SCRIPT_DIR}/package.json" "${INSTALL_DIR}/package.json"
 
 if [[ -n "$ENV_SOURCE_FILE" ]]; then
@@ -118,8 +145,22 @@ install -m 644 "${SCRIPT_DIR}/systemd/nms-collector-diagnostic-worker.service" "
 install -m 644 "${SCRIPT_DIR}/systemd/nms-collector-edge-analysis.service" "${SYSTEMD_DIR}/nms-collector-edge-analysis.service"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-collector-edge-analysis.timer" "${SYSTEMD_DIR}/nms-collector-edge-analysis.timer"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-iperf3-server.service" "${SYSTEMD_DIR}/nms-iperf3-server.service"
+install -m 644 "${SCRIPT_DIR}/systemd/nms-wifi-analysis.service" "${SYSTEMD_DIR}/nms-wifi-analysis.service"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-metro-agent-v1.service" "${SYSTEMD_DIR}/nms-metro-agent-v1.service"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-metro-agent-v1.timer" "${SYSTEMD_DIR}/nms-metro-agent-v1.timer"
+install -d -m 700 /var/lib/nms-collector/wifi-analysis /var/lib/nms-collector/wifi-analysis/queue
+install -d -m 750 /var/lib/nms-collector/measurement-sessions /var/lib/nms-collector/measurement-sessions/sessions
+
+for required_runtime in \
+  "${INSTALL_DIR}/nms-collector.js" \
+  "${INSTALL_DIR}/nms-measurement-session.js" \
+  "/usr/local/bin/nms_packet_flood.py" \
+  "/usr/local/bin/metro-nms-field-diagnostics"; do
+  if [[ ! -s "${required_runtime}" ]]; then
+    echo "required runtime was not installed: ${required_runtime}" >&2
+    exit 1
+  fi
+done
 install -d -m 700 /var/lib/nms-collector/metro-agent-v1 /var/lib/nms-collector/metro-agent-v1/queue
 install -d -m 755 /etc/NetworkManager/dispatcher.d
 install -m 755 "${SCRIPT_DIR}/nms-collector-network-change.sh" "/etc/NetworkManager/dispatcher.d/90-nms-collector-network-change"
@@ -199,6 +240,18 @@ else
   systemctl disable --now nms-collector-edge-analysis.timer nms-collector-edge-analysis.service 2>/dev/null || true
 fi
 
+if grep -q '^WIFI_ANALYSIS_ENABLED=true' "${ENV_DIR}/collector.env"; then
+  if [[ "$COLLECTOR_READY" == "true" ]]; then
+    systemctl enable --now nms-wifi-analysis.service
+    systemctl restart nms-wifi-analysis.service
+  else
+    systemctl disable --now nms-wifi-analysis.service 2>/dev/null || true
+    echo "Wi-Fi analysis kept disabled until nms-collector doctor passes"
+  fi
+else
+  systemctl disable --now nms-wifi-analysis.service 2>/dev/null || true
+fi
+
 if grep -q '^METRO_AGENT_V1_ENABLED=true' "${ENV_DIR}/collector.env"; then
   if [[ "$COLLECTOR_READY" == "true" ]]; then
     systemctl enable --now nms-metro-agent-v1.timer
@@ -223,4 +276,5 @@ echo "check: systemctl status nms-collector-heartbeat.timer"
 echo "autostart: systemctl status nms-collector-autostart.service"
 echo "diagnostics: systemctl status nms-collector-diagnostic-worker.service"
 echo "edge analysis: systemctl status nms-collector-edge-analysis.timer"
+echo "Wi-Fi analysis: systemctl status nms-wifi-analysis.service"
 echo "Metro Agent V1: systemctl status nms-metro-agent-v1.timer"

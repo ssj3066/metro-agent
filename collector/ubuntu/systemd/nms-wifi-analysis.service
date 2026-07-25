@@ -1,0 +1,20 @@
+[Unit]
+Description=METRO wired, Wi-Fi and RF analysis collector
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node /opt/nms-collector/nms-wifi-analysis.js run
+Restart=on-failure
+RestartSec=5
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nms-collector/wifi-analysis /var/lib/nms-collector/measurement-sessions
+
+[Install]
+WantedBy=multi-user.target

@@ -168,9 +168,12 @@ function normalizeFieldMeasurementProfile(value) {
     if (!customer || typeof customer !== 'object' || Array.isArray(customer)) {
         throw new Error('field profile customer contact is required');
     }
-    return {
+    const normalized = {
         schema_version: truncateText(value.schema_version, 80) || 'collector-field-profile-v1',
         site_name: requireShortText(value.site_name, 'field profile site name'),
+        customer_name: truncateText(value.customer_name, 160) || null,
+        address: truncateText(value.address, 500) || null,
+        scope_started_at: truncateText(value.scope_started_at, 80) || null,
         metro_contact: {
             name: requireShortText(metro.name, 'Metro contact name', 120),
             phone: requireShortText(metro.phone, 'Metro contact phone', 60)
@@ -180,6 +183,15 @@ function normalizeFieldMeasurementProfile(value) {
             phone: requireShortText(customer.phone, 'Customer contact phone', 60)
         }
     };
+    for (const field of ['site_id', 'customer_id']) {
+        if (value[field] === undefined || value[field] === null || value[field] === '') continue;
+        const parsed = Number(value[field]);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+            throw new Error(`field profile ${field} must be a positive integer`);
+        }
+        normalized[field] = parsed;
+    }
+    return normalized;
 }
 
 function maxSeverity(current, next) {
@@ -519,6 +531,7 @@ function buildHeartbeatPayload(env, options = {}) {
         || (hostnameOverrideProvided ? options.hostname : '')
         || os.hostname().split('.')[0]
     ).trim();
+    const collectorName = String(env.COLLECTOR_NAME || '').trim();
     const primaryNetwork = options.primaryNetwork || collectPrimaryNetwork(options.execFn || execFileSync);
     const configuredPrivateIp = String(env.COLLECTOR_PRIVATE_IP || '').trim();
     const allowConfiguredPrivateIp = parseBoolean(env.COLLECTOR_PRIVATE_IP_OVERRIDE, false);
@@ -576,6 +589,10 @@ function buildHeartbeatPayload(env, options = {}) {
             vpn: wireGuardStatus
         }
     };
+
+    if (collectorName) {
+        payload.name = collectorName;
+    }
 
     if (privateIp) {
         payload.private_ip = privateIp;
@@ -1313,6 +1330,80 @@ function isMulticastMac(value) {
     return Number.isInteger(firstOctet) && (firstOctet & 1) === 1 && !isBroadcastMac(value);
 }
 
+const PACKET_FLOOD_THRESHOLDS_PPS = Object.freeze({
+    broadcast: 100,
+    multicast: 100,
+    arp: 20,
+    mdns: 10,
+    ssdp: 10,
+    name_resolution: 20
+});
+
+function buildPacketFloodSummary(counts, packetCount, observedDurationSeconds, linkLayerDestinationCount) {
+    const count = (key) => Number(counts[key] || 0);
+    const rate = (key) => observedDurationSeconds >= 5
+        ? Number((count(key) / observedDurationSeconds).toFixed(2))
+        : null;
+    const ratio = (key) => packetCount > 0
+        ? Number(((count(key) * 100) / packetCount).toFixed(2))
+        : null;
+    const rates = {
+        broadcast: rate('broadcast'),
+        multicast: rate('multicast'),
+        arp: rate('arp'),
+        mdns: rate('mdns'),
+        ssdp: rate('ssdp'),
+        llmnr: rate('llmnr'),
+        nbns: rate('nbns'),
+        dhcp: rate('dhcp'),
+        name_resolution: observedDurationSeconds >= 5
+            ? Number(((count('llmnr') + count('nbns')) / observedDurationSeconds).toFixed(2))
+            : null
+    };
+    const missingData = [];
+    if (observedDurationSeconds < 5) missingData.push('관측시간 5초 미만');
+    if (packetCount < 20) missingData.push('패킷 20개 미만');
+    if (linkLayerDestinationCount === 0) missingData.push('이더넷 목적지 MAC 미관측');
+    const signals = [];
+    if (observedDurationSeconds >= 5 && packetCount >= 20) {
+        for (const [type, threshold] of Object.entries(PACKET_FLOOD_THRESHOLDS_PPS)) {
+            const observed = rates[type];
+            if (observed !== null && observed >= threshold) {
+                signals.push({ type, observed_pps: observed, threshold_pps: threshold });
+            }
+        }
+    }
+    return {
+        schema_version: 'metro-packet-flood-summary-v1',
+        status: signals.length ? 'candidate' : (missingData.slice(0, 2).length ? 'insufficient_data' : 'no_candidate'),
+        counts: {
+            broadcast: count('broadcast'),
+            multicast: count('multicast'),
+            arp: count('arp'),
+            mdns: count('mdns'),
+            ssdp: count('ssdp'),
+            llmnr: count('llmnr'),
+            nbns: count('nbns'),
+            dhcp: count('dhcp')
+        },
+        rates_pps: rates,
+        ratios_pct: {
+            broadcast: ratio('broadcast'),
+            multicast: ratio('multicast'),
+            arp: ratio('arp'),
+            mdns: ratio('mdns'),
+            ssdp: ratio('ssdp'),
+            llmnr: ratio('llmnr'),
+            nbns: ratio('nbns'),
+            dhcp: ratio('dhcp')
+        },
+        thresholds_pps: PACKET_FLOOD_THRESHOLDS_PPS,
+        signals,
+        missing_data: missingData,
+        scope_notice: '현재 인터페이스 관측값입니다. 전체 현장 확정에는 SPAN/미러 또는 트렁크 관측이 필요합니다.'
+    };
+}
+
 function parseTsharkPacketRows(text) {
     const protocolCounts = new Map();
     const endpointCounts = new Map();
@@ -1326,6 +1417,16 @@ function parseTsharkPacketRows(text) {
     let broadcastCount = 0;
     let multicastCount = 0;
     let linkLayerDestinationCount = 0;
+    const floodCounts = {
+        broadcast: 0,
+        multicast: 0,
+        arp: 0,
+        mdns: 0,
+        ssdp: 0,
+        llmnr: 0,
+        nbns: 0,
+        dhcp: 0
+    };
     let firstEpoch = null;
     let lastEpoch = null;
 
@@ -1372,9 +1473,25 @@ function parseTsharkPacketRows(text) {
         if (ipv6Source || ipv6Destination) ipv6Count += 1;
         if (ethDestination) {
             linkLayerDestinationCount += 1;
-            if (isBroadcastMac(ethDestination)) broadcastCount += 1;
-            if (isMulticastMac(ethDestination)) multicastCount += 1;
+            if (isBroadcastMac(ethDestination)) {
+                broadcastCount += 1;
+                floodCounts.broadcast += 1;
+            }
+            if (isMulticastMac(ethDestination)) {
+                multicastCount += 1;
+                floodCounts.multicast += 1;
+            }
         }
+        const udpPorts = new Set([udpSourcePort, udpDestinationPort].filter(Boolean));
+        if (protocol === 'ARP' || arpSource || arpDestination) floodCounts.arp += 1;
+        if (protocol === 'MDNS' || udpPorts.has('5353')) floodCounts.mdns += 1;
+        if (protocol === 'SSDP' || udpPorts.has('1900')) floodCounts.ssdp += 1;
+        if (protocol === 'LLMNR' || udpPorts.has('5355')) floodCounts.llmnr += 1;
+        if (protocol === 'NBNS' || protocol === 'NBNAME' || udpPorts.has('137')) floodCounts.nbns += 1;
+        if (
+            ['DHCP', 'DHCPV6', 'BOOTP'].includes(protocol)
+            || ['67', '68', '546', '547'].some((port) => udpPorts.has(port))
+        ) floodCounts.dhcp += 1;
         if (vlanId) {
             for (const value of vlanId.split(',')) {
                 if (/^\d+$/.test(value.trim())) vlanIds.add(Number(value.trim()));
@@ -1401,6 +1518,18 @@ function parseTsharkPacketRows(text) {
         link_layer_visibility: linkLayerDestinationCount > 0,
         broadcast_count: broadcastCount,
         multicast_count: multicastCount,
+        arp_count: floodCounts.arp,
+        mdns_count: floodCounts.mdns,
+        ssdp_count: floodCounts.ssdp,
+        llmnr_count: floodCounts.llmnr,
+        nbns_count: floodCounts.nbns,
+        dhcp_count: floodCounts.dhcp,
+        flood_summary: buildPacketFloodSummary(
+            floodCounts,
+            packetCount,
+            observedDurationSeconds,
+            linkLayerDestinationCount
+        ),
         vlan_ids: [...vlanIds].sort((a, b) => a - b),
         top_protocols: topCountRows(protocolCounts, 12, 'protocol'),
         top_endpoints: topCountRows(endpointCounts, 12, 'endpoint'),
@@ -1997,6 +2126,12 @@ function finalizeMeasurementMetrics(aggregates) {
 async function runMeasurementSessionDiagnostic(command, env) {
     const requestedDurationSeconds = Math.min(28800, Math.max(10, parsePositiveInteger(command.options?.duration_seconds, 300)));
     const intervalSeconds = Math.min(300, Math.max(2, parsePositiveInteger(command.options?.interval_seconds, 10)));
+    const moduleRunIds = command.options?.module_run_ids
+        && typeof command.options.module_run_ids === 'object'
+        && !Array.isArray(command.options.module_run_ids)
+        ? command.options.module_run_ids
+        : {};
+    const timezone = String(command.options?.timezone || 'Asia/Seoul');
     const expectedRounds = Math.floor(requestedDurationSeconds / intervalSeconds) + 1;
     if (expectedRounds > 2000) throw new Error('measurement session exceeds the 2,000 round safety limit');
 
@@ -2022,7 +2157,15 @@ async function runMeasurementSessionDiagnostic(command, env) {
         if (waitMs > 0) await sleep(waitMs);
 
         const observedAt = new Date().toISOString();
-        const sample = { observed_at: observedAt, values: {}, failed_metrics: [] };
+        const sample = {
+            sampled_at: observedAt,
+            observed_at: observedAt,
+            timezone,
+            source_delay_ms: null,
+            sample_status: 'success',
+            values: {},
+            failed_metrics: []
+        };
         const pingResults = await Promise.all(pingTargets.map(async (item) => {
             if (!item.target) return { ...item, summary: null };
             const result = item.key === 'gateway'
@@ -2084,6 +2227,14 @@ async function runMeasurementSessionDiagnostic(command, env) {
         }
         previousInterfaces = currentInterfaces;
         previousInterfaceAtMs = currentInterfaceAtMs;
+        sample.source_delay_ms = Number(Math.max(
+            0,
+            Date.now() - new Date(observedAt).getTime()
+        ).toFixed(3));
+        if (Object.keys(sample.values).length
+            && sample.failed_metrics.length === Object.keys(sample.values).length) {
+            sample.sample_status = 'failure';
+        }
         roundsCompleted += 1;
         if (round === 0 || round === expectedRounds - 1 || round % rawSampleStride === 0) rawSamples.push(sample);
     }
@@ -2094,6 +2245,8 @@ async function runMeasurementSessionDiagnostic(command, env) {
         measurement_session: {
             schema_version: 'collector-measurement-session-v1',
             source: 'ubuntu_collector_measurement_session',
+            timezone,
+            module_run_ids: moduleRunIds,
             started_at: startedAt,
             ended_at: new Date(endedAtMs).toISOString(),
             requested_duration_seconds: requestedDurationSeconds,
@@ -2443,7 +2596,7 @@ function listQueueFiles(directory) {
         .sort();
 }
 
-function buildQueuedFieldMeasurement(fieldProfile, measurementSession, now = new Date()) {
+function buildQueuedFieldMeasurement(fieldProfile, measurementSession, now = new Date(), measurementSessionId = null) {
     const clientSessionId = crypto.randomUUID();
     return {
         schema_version: 'collector-field-measurement-queue-v1',
@@ -2455,6 +2608,7 @@ function buildQueuedFieldMeasurement(fieldProfile, measurementSession, now = new
         last_error: null,
         delivered_at: null,
         session_kind: 'measurement',
+        measurement_session_id: measurementSessionId,
         field_profile: normalizeFieldMeasurementProfile(fieldProfile),
         measurement_session: measurementSession
     };
@@ -2525,6 +2679,7 @@ async function postOfflineMeasurementSession(env, report, item) {
         { 'Content-Type': 'application/json', 'X-Collector-Token': String(env.COLLECTOR_TOKEN).trim() },
         {
             client_session_id: item.client_session_id,
+            measurement_session_id: item.measurement_session_id || null,
             field_profile: item.field_profile,
             measurement_session: item.measurement_session
         },
@@ -2591,7 +2746,14 @@ async function requestSelfMeasurementCommand(env, report, durationSeconds, inter
     ));
 }
 
-async function runLocalMeasurementSession(env, durationValue, intervalValue, fieldProfile) {
+async function runLocalMeasurementSession(
+    env,
+    durationValue,
+    intervalValue,
+    fieldProfile,
+    measurementSessionId = null,
+    moduleRunIds = {}
+) {
     const report = inspectCollectorEnv(env);
     if (!report.ready) throw new Error(report.errors.join('; '));
     const durationSeconds = Math.min(28800, Math.max(10, parsePositiveInteger(durationValue, 300)));
@@ -2604,10 +2766,17 @@ async function runLocalMeasurementSession(env, durationValue, intervalValue, fie
         command_type: 'measurement',
         options: {
             duration_seconds: durationSeconds,
-            interval_seconds: intervalSeconds
+            interval_seconds: intervalSeconds,
+            timezone: 'Asia/Seoul',
+            module_run_ids: moduleRunIds
         }
     }, env);
-    const queued = buildQueuedFieldMeasurement(profile, result.measurement_session);
+    const queued = buildQueuedFieldMeasurement(
+        profile,
+        result.measurement_session,
+        new Date(),
+        measurementSessionId
+    );
     persistQueuedFieldMeasurement(env, queued);
     const delivery = await flushQueuedFieldMeasurements(env);
     const itemResult = delivery.items.find((item) => item.client_session_id === queued.client_session_id) || null;
@@ -4045,11 +4214,18 @@ async function main(argv = process.argv.slice(2), env = null) {
         if (argv[3] !== '--field-profile-stdin') {
             throw new Error('measurement-session requires --field-profile-stdin');
         }
+        const parentSessionIndex = argv.indexOf('--measurement-session-id');
+        const parentSessionId = parentSessionIndex >= 0 ? String(argv[parentSessionIndex + 1] || '').trim() : null;
+        if (parentSessionId
+            && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parentSessionId)) {
+            throw new Error('measurement-session --measurement-session-id must be a UUID');
+        }
         const result = await runLocalMeasurementSession(
             effectiveEnv,
             argv[1],
             argv[2],
-            await readFieldMeasurementProfileFromStdin()
+            await readFieldMeasurementProfileFromStdin(),
+            parentSessionId
         );
         process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         return;
@@ -4162,6 +4338,7 @@ module.exports = {
     resolveNmsUrls,
     runLocalMeasurementSession,
     runLocalDiagnosticSnapshot,
+    runMeasurementSessionDiagnostic,
     fetchPulseLocalStatus,
     pollAndPostPulseLocalStatus,
     summarizePingStep

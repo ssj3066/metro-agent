@@ -48,12 +48,27 @@ const {
 
 test('field measurement profile requires independent site and contact data', () => {
     const profile = normalizeFieldMeasurementProfile({
+        site_id: 17,
+        customer_id: 9,
         site_name: '테스트 현장',
+        customer_name: '테스트 고객',
         metro_contact: { name: '메트로 담당자', phone: '010-0000-0000' },
         customer_contact: { name: '고객사 담당자', phone: '010-0000-0001' }
     });
 
     assert.equal(profile.site_name, '테스트 현장');
+    assert.equal(profile.site_id, 17);
+    assert.equal(profile.customer_id, 9);
+    assert.equal(profile.customer_name, '테스트 고객');
+    assert.throws(
+        () => normalizeFieldMeasurementProfile({
+            site_id: '잘못된 값',
+            site_name: '테스트 현장',
+            metro_contact: { name: '메트로 담당자', phone: '010-0000-0000' },
+            customer_contact: { name: '고객사 담당자', phone: '010-0000-0001' }
+        }),
+        /site_id must be a positive integer/
+    );
     assert.throws(() => normalizeFieldMeasurementProfile({ site_name: '누락' }), /metro contact/);
 });
 
@@ -69,7 +84,8 @@ test('field measurement queue persists a pending item without a server connectio
             started_at: '2026-07-21T00:00:00.000Z',
             ended_at: '2026-07-21T00:00:10.000Z',
             metrics: []
-        });
+        }, new Date(), '2bb9b1a0-8322-4d4c-8781-c78d5654a366');
+        assert.equal(item.measurement_session_id, '2bb9b1a0-8322-4d4c-8781-c78d5654a366');
         persistQueuedFieldMeasurement(env, item);
 
         const rows = listQueuedFieldMeasurements(env);
@@ -188,6 +204,11 @@ test('parseTsharkPacketRows builds bounded traffic statistics', () => {
     assert.equal(summary.byte_count, 600);
     assert.equal(summary.broadcast_count, 1);
     assert.equal(summary.multicast_count, 1);
+    assert.equal(summary.arp_count, 1);
+    assert.equal(summary.mdns_count, 1);
+    assert.equal(summary.flood_summary.status, 'insufficient_data');
+    assert.equal(summary.flood_summary.counts.mdns, 1);
+    assert.match(summary.flood_summary.scope_notice, /SPAN/);
     assert.equal(summary.link_layer_visibility, true);
     assert.deepEqual(summary.vlan_ids, [10, 20]);
     assert.equal(summary.top_protocols[0].count, 1);
@@ -202,6 +223,30 @@ test('parseTsharkPacketRows uses ARP protocol addresses when any interface hides
     assert.equal(summary.link_layer_visibility, false);
     assert.equal(summary.broadcast_count, 0);
     assert.deepEqual(summary.top_endpoints.map((item) => item.endpoint), ['192.168.1.1', '192.168.1.130']);
+});
+
+test('parseTsharkPacketRows classifies flooding protocols by UDP port', () => {
+    const row = (epoch, protocol, sourcePort, destinationPort) => [
+        epoch, '100', '00:11:22:33:44:55', '01:00:5e:00:00:fb',
+        '192.168.1.10', '224.0.0.251', '', '', protocol,
+        '', '', sourcePort, destinationPort, ''
+    ].join('\t');
+    const rows = [
+        row('1000.000', 'UDP', '5353', '5353'),
+        row('1001.000', 'UDP', '1900', '1900'),
+        row('1002.000', 'UDP', '5355', '5355'),
+        row('1003.000', 'UDP', '137', '137'),
+        row('1006.000', 'UDP', '68', '67'),
+        ...Array.from({ length: 15 }, (_, index) => row(String(1006.1 + index / 10), 'UDP', '5000', '5001'))
+    ].join('\n');
+    const summary = parseTsharkPacketRows(rows);
+
+    assert.equal(summary.mdns_count, 1);
+    assert.equal(summary.ssdp_count, 1);
+    assert.equal(summary.llmnr_count, 1);
+    assert.equal(summary.nbns_count, 1);
+    assert.equal(summary.dhcp_count, 1);
+    assert.equal(summary.flood_summary.status, 'no_candidate');
 });
 
 test('parseTsharkDetailRows counts errors and discovery evidence', () => {
@@ -429,6 +474,7 @@ test('inspectLocalServices includes rsyslog and trap units only when enabled', (
 
 test('buildHeartbeatPayload normalizes metadata, feature flags, and omits blank IP values', () => {
     const payload = buildHeartbeatPayload({
+        COLLECTOR_NAME: '메트로정보통신 네트워크 현장 분석기',
         COLLECTOR_HOSTNAME: 'site-a-agent',
         COLLECTOR_SOFTWARE_VERSION: '0.2.0',
         COLLECTOR_STATUS: 'active',
@@ -448,6 +494,7 @@ test('buildHeartbeatPayload normalizes metadata, feature flags, and omits blank 
         hostname: 'ignored-host'
     });
 
+    assert.equal(payload.name, '메트로정보통신 네트워크 현장 분석기');
     assert.equal(payload.hostname, 'site-a-agent');
     assert.equal(payload.software_version, '0.2.0');
     assert.deepEqual(payload.metadata.capabilities, ['heartbeat', 'syslog', 'trap', 'diagnostics', 'edge-analysis']);

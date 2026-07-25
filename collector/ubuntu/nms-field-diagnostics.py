@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import ipaddress
+import getpass
+import grp
 import json
+import math
 import os
 import queue
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -17,12 +19,95 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 sys.path.insert(0, "/usr/local/lib/metro-nms-collector")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ict_field_client import IctFieldClient, load_device_config
+from nms_packet_flood import add_packet, empty_counts, summarize_counts
 
 HELPER = "/opt/nms-collector/configure-snmp-targets.sh"
 NODE = "/usr/local/bin/node"
 COLLECTOR = "/opt/nms-collector/nms-collector.js"
+MEASUREMENT_SESSION = "/opt/nms-collector/nms-measurement-session.js"
+MEASUREMENT_CONTROL = "/opt/nms-collector/measurement-session-control.sh"
 GUI_OPS = "/opt/nms-collector/nms-gui-operations.sh"
+TINYSA_HELPER = "/opt/nms-collector/nms-tinysa-sweep.py"
+TINYSA_CONFIG_HELPER = "/opt/nms-collector/configure-tinysa.sh"
+DEFAULT_COLLECTOR_NAME = "메트로정보통신 네트워크 현장 분석기"
+TINYSA_MODEL = "tinySA Ultra+ ZS407"
+TINYSA_DEVICE = "/dev/tinysa4"
+TINYSA_BAND_CATALOG = {
+    "AP": (
+        {"id": "wifi_2_4ghz", "label": "2.4GHz Wi-Fi", "start_mhz": "2400", "stop_mhz": "2500", "axis": "wifi_2_4"},
+        {"id": "wifi_5ghz", "label": "5GHz Wi-Fi", "start_mhz": "5150", "stop_mhz": "5850", "axis": "wifi_5"},
+        {"id": "wifi_6ghz", "label": "6GHz Wi-Fi", "start_mhz": "5925", "stop_mhz": "7125", "axis": "wifi_6"},
+    ),
+    "방송": (
+        {"id": "broadcast_fm", "label": "FM 라디오", "start_mhz": "87.5", "stop_mhz": "108", "axis": "frequency"},
+        {"id": "broadcast_vhf", "label": "VHF 방송 (DMB 포함)", "start_mhz": "174", "stop_mhz": "216", "axis": "frequency"},
+        {"id": "broadcast_uhf_tv", "label": "UHF 지상파 TV / TVWS", "start_mhz": "470", "stop_mhz": "698", "axis": "frequency"},
+        {"id": "satellite_lnb_if", "label": "위성 LNB 출력 IF", "start_mhz": "950", "stop_mhz": "2150", "axis": "frequency"},
+    ),
+    "가전": (
+        {"id": "appliance_rfid_13m", "label": "13.56MHz NFC / RFID", "start_mhz": "13.552", "stop_mhz": "13.568", "axis": "frequency"},
+        {"id": "appliance_srd_433m", "label": "433MHz 소출력 기기", "start_mhz": "433.67", "stop_mhz": "434.17", "axis": "frequency"},
+        {"id": "appliance_rfid_900m", "label": "900MHz RFID / IoT", "start_mhz": "917", "stop_mhz": "923.5", "axis": "frequency"},
+        {"id": "appliance_2_4ghz", "label": "2.4GHz Bluetooth / Zigbee / 가전", "start_mhz": "2400", "stop_mhz": "2483.5", "axis": "frequency"},
+        {"id": "appliance_5_8ghz", "label": "5.8GHz 데이터 / 가전", "start_mhz": "5725", "stop_mhz": "5825", "axis": "frequency"},
+    ),
+    "사용자 정의": (
+        {"id": "custom", "label": "직접 입력", "start_mhz": "", "stop_mhz": "", "axis": "frequency"},
+    ),
+}
+TINYSA_LEGACY_BANDS = {
+    "2.4GHz": "wifi_2_4ghz",
+    "5GHz": "wifi_5ghz",
+    "6GHz": "wifi_6ghz",
+    "custom": "custom",
+}
+TINYSA_WIFI_AXIS = {
+    "wifi_2_4": {"label": "2.4 GHz Wi-Fi", "grid_step_hz": 10_000_000},
+    "wifi_5": {"label": "5 GHz Wi-Fi", "grid_step_hz": 100_000_000},
+    "wifi_6": {"label": "6 GHz Wi-Fi", "grid_step_hz": 200_000_000},
+}
+TINYSA_CALIBRATION_OPTIONS = {
+    "교정 완료": "level_calibrated",
+    "미보정": "uncalibrated",
+    "확인 필요": "unknown",
+}
+TINYSA_AGGREGATION_OPTIONS = {
+    "단일 스윕": "single_sweep",
+    "최대값 유지 (Max Hold)": "max_hold",
+    "평균 (Average)": "average",
+    "최소값 유지 (Min Hold)": "min_hold",
+}
+TINYSA_ERROR_LABELS = {
+    "device_not_found": "USB 장치를 찾지 못했습니다. 케이블과 장치 경로를 확인하세요.",
+    "permission_denied": "장치 접근 권한이 없습니다. dialout 그룹과 udev 규칙을 확인하세요.",
+    "device_busy": "다른 측정 작업이 장치를 사용 중입니다. 자동수집 완료 후 다시 시도하세요.",
+    "command_timeout": "장비 응답 시간이 초과되었습니다. USB 연결과 펌웨어 상태를 확인하세요.",
+    "dependency_missing": "pyserial 구성요소가 설치되지 않았습니다.",
+    "protocol_error": "장비 응답 형식이 올바르지 않습니다. 모델과 펌웨어를 확인하세요.",
+    "measurement_failed": "RF 측정에 실패했습니다. 장치 로그를 확인하세요.",
+}
+
+def tinysa_permission_message(device=TINYSA_DEVICE):
+    path=Path(device)
+    if not path.exists() or os.access(path,os.R_OK|os.W_OK):
+        return None
+    try:
+        dialout=grp.getgrnam("dialout")
+        configured=getpass.getuser() in dialout.gr_mem
+        active=dialout.gr_gid in os.getgroups()
+    except KeyError:
+        configured=False; active=False
+    if configured and not active:
+        return (
+            "현재 데스크톱 로그인에 새 dialout 권한이 아직 반영되지 않았습니다. "
+            "앱을 다시 실행하거나 Ubuntu에서 한 번 로그아웃 후 로그인하세요."
+        )
+    return (
+        "tinySA 장치 읽기·쓰기 권한이 없습니다. 설치 관리자가 사용자를 "
+        "dialout 그룹에 추가하고 udev 규칙을 다시 적용해야 합니다."
+    )
 FIELD_PROFILE_STORE = Path.home() / ".config" / "metro-nms-field-collector" / "field-profiles.json"
+COLLECTOR_SETTINGS_STORE = Path.home() / ".config" / "metro-nms-field-collector" / "collector-settings.json"
 ICT_DEVICE_CONFIG = Path.home() / ".config" / "metro-nms-field-collector" / "ict-manager-device.json"
 ICT_OFFLINE_QUEUE = Path.home() / ".config" / "metro-nms-field-collector" / "ict-manager-offline-queue.json"
 ICT_SITE_CACHE = Path.home() / ".config" / "metro-nms-field-collector" / "ict-manager-sites-cache.json"
@@ -49,6 +134,7 @@ COMMANDS = {
 }
 CAPTURE_PROFILES = {
     "전체 헤더": "overview",
+    "플러딩 분석": "flood",
     "기본 통신": "basic",
     "DNS": "dns",
     "DHCP": "dhcp",
@@ -85,6 +171,300 @@ def parse_settings(text):
     data = json.loads(text.strip())
     data.setdefault("targets", [])
     return data
+
+def format_measurement_session_result(payload):
+    state_labels={
+        "idle":"대기","preflight":"사전 점검","running":"측정 중","paused":"일시 정지",
+        "stopping":"안전 종료 중","completed":"완료","partial":"부분 완료",
+        "failed":"실패","cancelled":"취소",
+    }
+    module_labels={
+        "wired":"유선","wireless":"무선","rf":"RF 스펙트럼",
+        "packet_capture":"패킷 캡처","system":"시스템",
+    }
+    module_state_labels={
+        "pending":"대기","running":"측정 중","paused":"일시 정지","completed":"완료",
+        "failed":"실패","unsupported":"지원 안 됨","skipped":"건너뜀","stopped":"안전 중지",
+    }
+    profile=payload.get("field_profile") if isinstance(payload.get("field_profile"),dict) else {}
+    started=payload.get("started_at")
+    ended=payload.get("ended_at")
+    def local_time(value):
+        if not value:
+            return "-"
+        try:
+            return datetime.fromisoformat(str(value).replace("Z","+00:00")).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return str(value)
+    lines=[
+        "[측정 세션 결과]",
+        f"현장: {profile.get('site_name') or '-'}",
+        f"상태: {state_labels.get(payload.get('status'),payload.get('status') or '확인 불가')}",
+        f"세션 ID: {payload.get('measurement_session_id') or '-'}",
+        f"측정 시각: {local_time(started)} ~ {local_time(ended)}",
+    ]
+    module_runs=payload.get("module_runs") if isinstance(payload.get("module_runs"),dict) else {}
+    summary=payload.get("module_summary") if isinstance(payload.get("module_summary"),dict) else {}
+    safe_stopped=payload.get("finalize_reason")=="operator_stop" and payload.get("status") in (
+        "completed","partial","failed","cancelled"
+    )
+    lines.append("")
+    lines.append("[모듈별 결과]")
+    for key in ("wired","wireless","rf","packet_capture","system"):
+        module_run=module_runs.get(key) if isinstance(module_runs.get(key),dict) else {}
+        summarized=summary.get(key) if isinstance(summary.get(key),dict) else {}
+        if not module_run and not summarized:
+            continue
+        run={**module_run,**summarized}
+        state=run.get("status") or "unknown"
+        corrected=safe_stopped and state in ("pending","running","paused")
+        if corrected:
+            state="stopped"
+        sample_count=int(run.get("sample_count") or 0)
+        line=f"- {module_labels[key]}: {module_state_labels.get(state,state)} · 표본 {sample_count}개"
+        if corrected:
+            line+=" · 안전 중지 기록 보정"
+        settings=run.get("settings") if isinstance(run.get("settings"),dict) else {}
+        if key=="rf" and settings.get("expected_bands"):
+            labels={
+                "wifi_2_4ghz":"2.4GHz","wifi_5ghz":"5GHz","wifi_6ghz":"6GHz",
+            }
+            observed=", ".join(labels.get(value,value) for value in settings.get("observed_bands",[])) or "없음"
+            expected=", ".join(labels.get(value,value) for value in settings["expected_bands"])
+            line+=f" · 측정 대역 {observed} / 예정 {expected}"
+        if run.get("error_message"):
+            line+=f" · {run['error_message']}"
+        lines.append(line)
+    if payload.get("status")=="partial":
+        lines.extend(("", "부분 완료는 안전 중지 또는 일부 모듈 실패를 뜻합니다. 완료된 모듈의 결과는 보존됩니다."))
+    return "\n".join(lines)
+
+def normalize_collector_name(value):
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("수집기 이름을 입력하세요.")
+    if len(name) > 80:
+        raise ValueError("수집기 이름은 80자 이하여야 합니다.")
+    if any(ord(character) < 32 for character in name) or any(character in name for character in ('=', '"', '\\')):
+        raise ValueError("수집기 이름에 사용할 수 없는 문자가 있습니다.")
+    return name
+
+def load_collector_settings():
+    try:
+        payload = json.loads(COLLECTOR_SETTINGS_STORE.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+def update_collector_settings(updates):
+    payload = load_collector_settings()
+    payload.update(updates)
+    COLLECTOR_SETTINGS_STORE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = COLLECTOR_SETTINGS_STORE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, COLLECTOR_SETTINGS_STORE)
+    return payload
+
+def load_collector_name():
+    try:
+        return normalize_collector_name(load_collector_settings().get("collector_name"))
+    except ValueError:
+        return DEFAULT_COLLECTOR_NAME
+
+def save_collector_name(name):
+    normalized = normalize_collector_name(name)
+    update_collector_settings({"collector_name": normalized})
+    return normalized
+
+def tinysa_preset_by_id(preset_id):
+    normalized = TINYSA_LEGACY_BANDS.get(str(preset_id or "").strip(), str(preset_id or "").strip())
+    for category, presets in TINYSA_BAND_CATALOG.items():
+        for preset in presets:
+            if preset["id"] == normalized:
+                return category, preset
+    return None, None
+
+def tinysa_preset_by_label(category, label):
+    for preset in TINYSA_BAND_CATALOG.get(str(category or "").strip(), ()):
+        if preset["label"] == str(label or "").strip():
+            return preset
+    return None
+
+def tinysa_error_message(payload):
+    if not isinstance(payload, dict):
+        return "RF 장비 응답을 해석할 수 없습니다."
+    error_code = payload.get("error_code") or "measurement_failed"
+    detail = str(payload.get("error") or "").strip()
+    message = TINYSA_ERROR_LABELS.get(error_code, TINYSA_ERROR_LABELS["measurement_failed"])
+    return f"{message} ({detail})" if detail else message
+
+def wifi_channel_centers(axis_mode):
+    if axis_mode == "wifi_2_4":
+        return [(channel, 2_412_000_000 + (channel - 1) * 5_000_000) for channel in range(1, 14)]
+    if axis_mode == "wifi_5":
+        channels = tuple(range(36, 65, 4)) + tuple(range(100, 145, 4)) + (149, 153, 157, 161, 165)
+        return [(channel, (5000 + channel * 5) * 1_000_000) for channel in channels]
+    if axis_mode == "wifi_6":
+        return [(channel, (5950 + channel * 5) * 1_000_000) for channel in range(1, 234, 4)]
+    return []
+
+def evenly_sampled_ticks(values, maximum_ticks):
+    if len(values) <= maximum_ticks:
+        return list(values)
+    indexes=sorted({
+        round(index*(len(values)-1)/(maximum_ticks-1))
+        for index in range(maximum_ticks)
+    })
+    return [values[index] for index in indexes]
+
+def nice_frequency_step(start_hz, stop_hz, target_lines=8):
+    span=max(1,stop_hz-start_hz)
+    raw=span/max(2,target_lines)
+    magnitude=10**math.floor(math.log10(raw))
+    normalized=raw/magnitude
+    factor=1 if normalized<=1 else 2 if normalized<=2 else 5 if normalized<=5 else 10
+    return int(factor*magnitude)
+
+def frequency_axis_ticks(start_hz, stop_hz, axis_mode):
+    specification=TINYSA_WIFI_AXIS.get(axis_mode)
+    step=(specification or {}).get("grid_step_hz") or nice_frequency_step(start_hz,stop_hz)
+    first=math.ceil(start_hz/step)*step
+    return [(frequency,"") for frequency in range(first,stop_hz+1,step)]
+
+def wifi_channel_axis_ticks(start_hz, stop_hz, axis_mode, maximum_ticks=14):
+    channels = [
+        (frequency_hz, f"CH {channel}")
+        for channel, frequency_hz in wifi_channel_centers(axis_mode)
+        if start_hz <= frequency_hz <= stop_hz
+    ]
+    return evenly_sampled_ticks(channels,maximum_ticks)
+
+def frequency_axis_summary(start_hz, stop_hz, axis_mode):
+    specification=TINYSA_WIFI_AXIS.get(axis_mode)
+    label=(specification or {}).get("label") or "사용자 지정 RF"
+    step=(specification or {}).get("grid_step_hz") or nice_frequency_step(start_hz,stop_hz)
+    return {
+        "label": label,
+        "grid_step_hz": step,
+        "range_label": f"{format_frequency(start_hz)} - {format_frequency(stop_hz)}",
+    }
+
+def format_frequency(frequency_hz):
+    if frequency_hz >= 1_000_000_000:
+        return f"{frequency_hz / 1_000_000_000:.3f}".rstrip("0").rstrip(".") + " GHz"
+    if frequency_hz >= 1_000_000:
+        return f"{frequency_hz / 1_000_000:.3f}".rstrip("0").rstrip(".") + " MHz"
+    return f"{frequency_hz / 1_000:.3f}".rstrip("0").rstrip(".") + " kHz"
+
+def normalize_tinysa_settings(
+    band, start_mhz, stop_mhz, points, interval_seconds, antenna_profile,
+    category=None, calibration_state="uncalibrated", aggregation="max_hold", sweep_repetitions=8,
+):
+    band = TINYSA_LEGACY_BANDS.get(str(band or "").strip(), str(band or "").strip())
+    preset_category, preset = tinysa_preset_by_id(band)
+    if not preset:
+        raise ValueError("측정 대역을 선택하세요.")
+    if category and str(category).strip() != preset_category:
+        raise ValueError("대분류와 중분류가 일치하지 않습니다.")
+    try:
+        start_hz = int(round(float(str(start_mhz).strip()) * 1_000_000))
+        stop_hz = int(round(float(str(stop_mhz).strip()) * 1_000_000))
+        point_count = int(str(points).strip())
+        interval = int(str(interval_seconds).strip())
+        repetitions = int(str(sweep_repetitions).strip())
+    except ValueError as exc:
+        raise ValueError("주파수, 포인트, 수집 주기는 숫자로 입력하세요.") from exc
+    if not 100_000 <= start_hz < stop_hz <= 7_300_000_000:
+        raise ValueError("ZS407 측정 범위는 0.1MHz 이상 7,300MHz 이하로 설정하세요.")
+    if not 51 <= point_count <= 450:
+        raise ValueError("스윕 포인트는 51~450으로 설정하세요.")
+    if not 5 <= interval <= 300:
+        raise ValueError("자동 수집 주기는 5~300초로 설정하세요.")
+    antenna = str(antenna_profile or "unknown").strip()
+    if not re.fullmatch(r"[a-zA-Z0-9._+-]{1,40}", antenna):
+        raise ValueError("안테나 프로필은 영문, 숫자, 점, 밑줄, +, -만 사용할 수 있습니다.")
+    calibration = str(calibration_state or "").strip()
+    if calibration not in TINYSA_CALIBRATION_OPTIONS.values():
+        raise ValueError("교정 상태를 선택하세요.")
+    aggregation = str(aggregation or "").strip()
+    if aggregation not in TINYSA_AGGREGATION_OPTIONS.values():
+        raise ValueError("집계 방식을 선택하세요.")
+    if not 1 <= repetitions <= 32:
+        raise ValueError("스윕 반복 횟수는 1~32로 설정하세요.")
+    if aggregation == "single_sweep":
+        repetitions = 1
+    return {
+        "model": TINYSA_MODEL,
+        "device": TINYSA_DEVICE,
+        "band": band,
+        "category": preset_category,
+        "preset_label": preset["label"],
+        "axis_mode": preset["axis"],
+        "start_hz": start_hz,
+        "stop_hz": stop_hz,
+        "points": point_count,
+        "interval_seconds": interval,
+        "antenna_profile": antenna,
+        "calibration_state": calibration,
+        "aggregation": aggregation,
+        "sweep_repetitions": repetitions,
+    }
+
+def load_tinysa_settings():
+    defaults = {
+        "enabled": "false",
+        "category": "AP",
+        "band": "wifi_5ghz",
+        "start_mhz": "5150",
+        "stop_mhz": "5850",
+        "points": "290",
+        "interval_seconds": "30",
+        "antenna_profile": "unknown",
+        "calibration_state": "uncalibrated",
+        "aggregation": "max_hold",
+        "sweep_repetitions": "8",
+    }
+    stored = load_collector_settings().get("tinysa")
+    if isinstance(stored, dict):
+        for key in defaults:
+            if stored.get(key) is not None:
+                defaults[key] = str(stored[key])
+    defaults["band"] = TINYSA_LEGACY_BANDS.get(defaults["band"], defaults["band"])
+    preset_category, preset = tinysa_preset_by_id(defaults["band"])
+    if preset:
+        defaults["category"] = preset_category
+    try:
+        normalize_tinysa_settings(
+            defaults["band"], defaults["start_mhz"], defaults["stop_mhz"],
+            defaults["points"], defaults["interval_seconds"], defaults["antenna_profile"], defaults["category"],
+            defaults["calibration_state"], defaults["aggregation"], defaults["sweep_repetitions"],
+        )
+    except ValueError:
+        return {
+            "enabled": "false", "category": "AP", "band": "wifi_5ghz", "start_mhz": "5150", "stop_mhz": "5850",
+            "points": "290", "interval_seconds": "30", "antenna_profile": "unknown",
+            "calibration_state": "uncalibrated",
+            "aggregation": "max_hold", "sweep_repetitions": "8",
+        }
+    return defaults
+
+def save_tinysa_settings(settings):
+    local = {
+        "enabled": "true" if settings.get("enabled") else "false",
+        "category": settings["category"],
+        "band": settings["band"],
+        "start_mhz": f'{settings["start_hz"] / 1_000_000:g}',
+        "stop_mhz": f'{settings["stop_hz"] / 1_000_000:g}',
+        "points": str(settings["points"]),
+        "interval_seconds": str(settings["interval_seconds"]),
+        "antenna_profile": settings["antenna_profile"],
+        "calibration_state": settings["calibration_state"],
+        "aggregation": settings["aggregation"],
+        "sweep_repetitions": str(settings["sweep_repetitions"]),
+    }
+    update_collector_settings({"tinysa": local})
+    return local
 
 def calculate_interface_rates(previous, current, elapsed_seconds):
     if not previous or elapsed_seconds <= 0:
@@ -148,6 +528,9 @@ class App:
         self.refresh_batch_pending = set()
         self.refresh_batch_errors = 0
         self.running_jobs = 0
+        self.collector_name = tk.StringVar(value=load_collector_name())
+        self.collector_name_status = tk.StringVar(value="저장하면 다음 heartbeat부터 중앙 표시명에 반영됩니다.")
+        self.pending_collector_name = None
         self.field_profile_name = tk.StringVar()
         self.field_site_name = tk.StringVar()
         self.metro_contact_name = tk.StringVar()
@@ -169,8 +552,14 @@ class App:
         self.live_capture_minutes = tk.StringVar(value="10")
         self.live_capture_status = tk.StringVar(value="정지됨")
         self.live_capture_process = None
+        self.live_capture_stopping = False
+        self.closing = False
+        self.close_deadline = None
         self.live_capture_packet_count = 0
         self.live_capture_path = None
+        self.live_flood_counts = empty_counts()
+        self.live_flood_started_at = None
+        self.live_flood_status = tk.StringVar(value="플러딩 분석 대기")
         self.live_monitor_interface = tk.StringVar()
         self.live_monitor_status = tk.StringVar(value="모니터링 정지")
         self.live_monitor_enabled = False
@@ -182,14 +571,50 @@ class App:
         self.measurement_value = tk.StringVar(value="5")
         self.measurement_unit = tk.StringVar(value="분")
         self.measurement_interval = tk.StringVar(value="10")
+        self.measurement_status = tk.StringVar(value="동시 측정 대기")
+        self.measurement_module_vars = {
+            "wired": tk.BooleanVar(value=True),
+            "wireless": tk.BooleanVar(value=True),
+            "rf": tk.BooleanVar(value=True),
+            "packet_capture": tk.BooleanVar(value=False),
+            "system": tk.BooleanVar(value=True),
+        }
         self.wireless_hidden_only = tk.BooleanVar(value=False)
         self.wireless_payload = None
+        tinysa = load_tinysa_settings()
+        self.tinysa_auto_enabled = tk.BooleanVar(value=str(tinysa.get("enabled", "false")).lower() == "true")
+        tinysa_category, tinysa_preset = tinysa_preset_by_id(tinysa["band"])
+        self.tinysa_category = tk.StringVar(value=tinysa_category or "AP")
+        self.tinysa_subcategory = tk.StringVar(value=(tinysa_preset or TINYSA_BAND_CATALOG["AP"][0])["label"])
+        self.tinysa_band = tk.StringVar(value=tinysa["band"])
+        self.tinysa_start_mhz = tk.StringVar(value=tinysa["start_mhz"])
+        self.tinysa_stop_mhz = tk.StringVar(value=tinysa["stop_mhz"])
+        self.tinysa_points = tk.StringVar(value=tinysa["points"])
+        self.tinysa_interval = tk.StringVar(value=tinysa["interval_seconds"])
+        self.tinysa_antenna = tk.StringVar(value=tinysa["antenna_profile"])
+        calibration_label=next(
+            (label for label,value in TINYSA_CALIBRATION_OPTIONS.items() if value == tinysa["calibration_state"]),
+            "확인 필요",
+        )
+        self.tinysa_calibration = tk.StringVar(value=calibration_label)
+        aggregation_label=next(
+            (label for label,value in TINYSA_AGGREGATION_OPTIONS.items() if value == tinysa["aggregation"]),
+            "최대값 유지 (Max Hold)",
+        )
+        self.tinysa_aggregation = tk.StringVar(value=aggregation_label)
+        self.tinysa_repetitions = tk.StringVar(value=tinysa["sweep_repetitions"])
+        self.tinysa_status = tk.StringVar(value="장비 상태 확인 전")
+        self.tinysa_metric_vars = {}
+        self.tinysa_payload = None
+        self.tinysa_multi_payload = None
+        self.pending_tinysa_settings = None
         self._configure_style()
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(150, self._drain)
         self.root.after(350, self.refresh_status)
         self.root.after(700, self.refresh_assigned_sites)
+        self.root.after(900, self.refresh_tinysa_config_state)
 
     def _configure_style(self):
         self.colors = {
@@ -272,7 +697,7 @@ class App:
         ttk.Label(main, textvariable=self.last_snapshot, style="Meta.TLabel").pack(fill="x", pady=(8, 8))
         self.page_host = ttk.Frame(main, style="Surface.TFrame")
         self.page_host.pack(fill="both", expand=True)
-        self._field_profile_tab(); self._status_tab(); self._source_tab(); self._live_monitor_tab(); self._measurement_tab(); self._offline_queue_tab(); self._diag_tab(); self._wireless_tab(); self._capture_tab(); self._vpn_tab(); self._snmp_tab(); self._service_tab()
+        self._field_profile_tab(); self._status_tab(); self._source_tab(); self._live_monitor_tab(); self._measurement_tab(); self._offline_queue_tab(); self._diag_tab(); self._wireless_tab(); self._spectrum_tab(); self._capture_tab(); self._vpn_tab(); self._snmp_tab(); self._service_tab()
         self.show_page("현장 프로필")
         self._polish_widgets(self.root)
 
@@ -296,6 +721,8 @@ class App:
             button.configure(style="NavActive.TButton" if name == title else "Nav.TButton")
         if title == "실시간 모니터링" and not self.live_monitor_enabled:
             self.start_live_monitor()
+        if title == "RF 스펙트럼":
+            self.refresh_tinysa_connection()
 
     def _polish_widgets(self, widget):
         for child in widget.winfo_children():
@@ -489,10 +916,25 @@ class App:
 
     def _status_tab(self):
         tab=self._new_page("수집기 현황")
+        identity=ttk.LabelFrame(tab,text="수집기 이름",padding=10); identity.pack(fill="x")
+        ttk.Entry(identity,textvariable=self.collector_name,width=52).grid(row=0,column=0,sticky="ew")
+        ttk.Button(identity,text="이름 저장",style="Accent.TButton",command=self.save_collector_identity).grid(row=0,column=1,padx=(8,0))
+        ttk.Label(identity,textvariable=self.collector_name_status).grid(row=1,column=0,columnspan=2,sticky="w",pady=(6,0))
+        identity.columnconfigure(0,weight=1)
         top=ttk.Frame(tab); top.pack(fill="x")
         ttk.Button(top,text="새로고침",command=self.refresh_status).pack(side="left")
         ttk.Label(top,text="현재 연결 네트워크는 수집기 heartbeat와 보고서에 함께 기록됩니다.").pack(side="left",padx=(12,0))
-        self.summary=tk.Text(tab,height=13,wrap="word",state="disabled",font=("monospace",10)); self.summary.pack(fill="both",expand=True,pady=(10,0))
+        self.summary=tk.Text(tab,height=11,wrap="word",state="disabled",font=("monospace",10)); self.summary.pack(fill="both",expand=True,pady=(10,0))
+
+    def save_collector_identity(self):
+        try:
+            name=normalize_collector_name(self.collector_name.get())
+        except ValueError as exc:
+            messagebox.showerror("입력 오류",str(exc))
+            return
+        self.pending_collector_name=name
+        self.collector_name_status.set("수집기 이름 저장 중")
+        self.privileged([GUI_OPS,"collector-name",name],label="수집기 이름 저장",timeout=45)
 
     def _source_tab(self):
         tab=self._new_page("수집 소스")
@@ -681,6 +1123,9 @@ class App:
         ttk.Checkbutton(top,text="숨김 SSID만 보기",variable=self.wireless_hidden_only,command=self.render_wireless).pack(side="left",padx=10)
         ttk.Button(top,text="결과 저장",command=self.save_wireless_result).pack(side="right")
         self.wireless_summary=tk.StringVar(value="주변 AP 스캔을 실행하면 숨김 SSID, 신호 품질과 채널 혼잡도를 분석합니다.")
+        self.wireless_ap_detail=tk.StringVar(
+            value="AP를 선택하면 신호 값과 숨김 BSSID의 의미를 간단히 설명합니다."
+        )
         ttk.Label(tab,textvariable=self.wireless_summary).pack(anchor="w",pady=(8,0))
         frame=ttk.LabelFrame(tab,text="주변 무선 네트워크",padding=8); frame.pack(fill="both",expand=True,pady=(8,0))
         columns=("active","ssid","hidden","bssid","band","channel","frequency","signal","quality","security")
@@ -693,17 +1138,38 @@ class App:
         for key,title,width in headings:
             self.wireless_tree.heading(key,text=title); self.wireless_tree.column(key,width=width,anchor="w")
         self.wireless_tree.pack(fill="both",expand=True)
+        self.wireless_tree.bind("<<TreeviewSelect>>",self.show_wireless_ap_detail)
+        ttk.Label(
+            frame,textvariable=self.wireless_ap_detail,justify="left",wraplength=900
+        ).pack(fill="x",pady=(7,0))
+        self.wireless_ap_rows={}
         analysis=ttk.LabelFrame(tab,text="신호·채널 분석",padding=8); analysis.pack(fill="x",pady=(8,0))
         self.wireless_analysis=tk.Text(analysis,height=7,wrap="word",state="disabled",font=("monospace",10)); self.wireless_analysis.pack(fill="x")
 
     def refresh_wireless(self):
         self.async_run("무선 분석",[GUI_OPS,"wireless-scan"],timeout=45)
 
+    def show_wireless_ap_detail(self, _event=None):
+        selected=self.wireless_tree.selection()
+        access_point=self.wireless_ap_rows.get(selected[0]) if selected else None
+        if not access_point:
+            self.wireless_ap_detail.set(
+                "AP를 선택하면 신호 값과 숨김 BSSID의 의미를 간단히 설명합니다."
+            )
+            return
+        ssid=access_point.get("ssid") or "숨김 SSID"
+        bssid=access_point.get("bssid") or "BSSID 미확인"
+        identity=access_point.get("identity_interpretation") or "장비 관계를 판단할 근거가 부족합니다."
+        signal=access_point.get("signal_interpretation") or "신호 해석 정보가 없습니다."
+        self.wireless_ap_detail.set(f"{ssid} · {bssid}\n{identity}\n{signal}")
+
     def render_wireless(self):
         if not self.wireless_payload:
             return
         payload=self.wireless_payload
         for row in self.wireless_tree.get_children(): self.wireless_tree.delete(row)
+        self.wireless_ap_rows={}
+        self.show_wireless_ap_detail()
         access_points=payload.get("access_points",[]) if isinstance(payload,dict) else []
         hidden_only=self.wireless_hidden_only.get()
         for access_point in access_points:
@@ -711,21 +1177,44 @@ class App:
                 continue
             ssid=access_point.get("ssid") or "(숨김 SSID)"
             frequency=access_point.get("frequency_mhz")
-            self.wireless_tree.insert("","end",values=(
+            row_id=self.wireless_tree.insert("","end",values=(
                 "연결중" if access_point.get("active") else "", ssid,
                 "숨김" if access_point.get("hidden") else "", access_point.get("bssid") or "-",
                 access_point.get("band") or "미확인", access_point.get("channel") or "-",
                 f"{frequency} MHz" if frequency else "-", f"{access_point.get('signal_pct',0)}%",
                 access_point.get("quality") or "미확인", access_point.get("security") or "개방형",
             ))
+            self.wireless_ap_rows[row_id]=access_point
         if not payload.get("available"):
             self.wireless_summary.set(f"무선 스캔 불가: {payload.get('reason','원인을 확인하세요.')}")
             self._set_text(self.wireless_analysis,payload.get("reason","") + "\n")
             return
         summary=payload.get("summary") or {}
         bands=", ".join(f"{band} {count}개" for band,count in (summary.get("band_counts") or {}).items()) or "없음"
-        self.wireless_summary.set(f"AP {summary.get('total_access_points',0)}개 · 숨김 SSID {summary.get('hidden_access_points',0)}개 · 대역: {bands}")
-        lines=["[채널 혼잡도]"]
+        supported=", ".join(summary.get("supported_bands") or []) or "지원 대역 미확인"
+        self.wireless_summary.set(
+            f"AP {summary.get('total_access_points',0)}개 · USB 무선장치 {summary.get('adapter_count',0)}개"
+            f" · 검색 가능: {supported} · 검출: {bands}"
+        )
+        lines=["[무선 장치]"]
+        for adapter in payload.get("usb_adapters") or []:
+            state={"ready":"사용 가능","driver_missing":"드라이버 없음","interface_missing":"인터페이스 없음"}.get(adapter.get("state"),adapter.get("state") or "미확인")
+            lines.append(
+                f"- {adapter.get('usb_id') or '-'} · {adapter.get('product') or adapter.get('manufacturer') or 'USB 무선장치'}"
+                f" · {state} · 인터페이스 {', '.join(adapter.get('interfaces') or []) or '-'}"
+            )
+        lines.append("\n[판단 기준]")
+        lines.append("- 신호 %는 NetworkManager 품질값이며 100%는 상한 표시입니다. 거리·출력 판단에는 원시 dBm을 확인합니다.")
+        lines.append("- 숨김 SSID와 로컬 MAC만으로 장비를 단정하지 않습니다. 채널·주파수·BSSID 관계와 AP 설정을 함께 확인합니다.")
+        related=[item for item in access_points if item.get("related_bssid")]
+        if related:
+            lines.append("\n[숨김/가상 BSSID 후보]")
+            for item in related[:10]:
+                lines.append(
+                    f"- {item.get('bssid')} → {item.get('related_ssid')}({item.get('related_bssid')})"
+                    f" · {item.get('identity_interpretation')}"
+                )
+        lines.append("\n[채널 혼잡도]")
         for item in (summary.get("channel_load") or [])[:10]:
             lines.append(f"- {item.get('band')} ch.{item.get('channel')}: {item.get('network_count')}개 / 강한 신호 {item.get('strong_network_count')}개 / {item.get('level')}")
         lines.append("\n[권장 조치]")
@@ -742,19 +1231,346 @@ class App:
         os.chmod(path,0o600)
         messagebox.showinfo("무선 분석",f"저장 완료: {path}")
 
+    def _spectrum_tab(self):
+        tab=self._new_page("RF 스펙트럼")
+        device=ttk.LabelFrame(tab,text="분석기",padding=10); device.pack(fill="x")
+        ttk.Label(device,text="모델").grid(row=0,column=0,sticky="w")
+        ttk.Label(device,text=TINYSA_MODEL).grid(row=0,column=1,sticky="w",padx=(8,24))
+        ttk.Label(device,text="장치").grid(row=0,column=2,sticky="w")
+        ttk.Label(device,text=TINYSA_DEVICE).grid(row=0,column=3,sticky="w",padx=(8,24))
+        ttk.Label(device,textvariable=self.tinysa_status).grid(row=0,column=4,sticky="e")
+        device.columnconfigure(4,weight=1)
+
+        settings=ttk.LabelFrame(tab,text="스윕 설정",padding=10); settings.pack(fill="x",pady=(10,0))
+        ttk.Label(settings,text="대분류").grid(row=0,column=0,sticky="w")
+        category_box=ttk.Combobox(settings,textvariable=self.tinysa_category,state="readonly",width=12,values=tuple(TINYSA_BAND_CATALOG))
+        category_box.grid(row=0,column=1,padx=(5,14)); category_box.bind("<<ComboboxSelected>>",self.on_tinysa_category_change)
+        ttk.Label(settings,text="중분류").grid(row=0,column=2,sticky="w")
+        self.tinysa_subcategory_box=ttk.Combobox(settings,textvariable=self.tinysa_subcategory,state="readonly",width=28)
+        self.tinysa_subcategory_box.grid(row=0,column=3,padx=(5,14)); self.tinysa_subcategory_box.bind("<<ComboboxSelected>>",lambda _event:self.apply_tinysa_preset())
+        self._set_tinysa_subcategory_values()
+        ttk.Label(settings,text="시작 MHz").grid(row=0,column=4,sticky="w")
+        ttk.Entry(settings,textvariable=self.tinysa_start_mhz,width=10).grid(row=0,column=5,padx=(5,14))
+        ttk.Label(settings,text="종료 MHz").grid(row=0,column=6,sticky="w")
+        ttk.Entry(settings,textvariable=self.tinysa_stop_mhz,width=10).grid(row=0,column=7,padx=(5,14))
+        ttk.Label(settings,text="포인트").grid(row=0,column=8,sticky="w")
+        ttk.Spinbox(settings,from_=51,to=450,textvariable=self.tinysa_points,width=7).grid(row=0,column=9,padx=(5,14))
+        ttk.Label(settings,text="주기(초)").grid(row=0,column=10,sticky="w")
+        ttk.Spinbox(settings,from_=5,to=300,textvariable=self.tinysa_interval,width=7).grid(row=0,column=11,padx=(5,0))
+        ttk.Label(settings,text="안테나 프로필").grid(row=1,column=0,sticky="w",pady=(9,0))
+        ttk.Entry(settings,textvariable=self.tinysa_antenna,width=18).grid(row=1,column=1,columnspan=2,sticky="w",padx=(5,14),pady=(9,0))
+        ttk.Label(settings,text="레벨 교정").grid(row=1,column=3,sticky="w",pady=(9,0))
+        ttk.Combobox(
+            settings,textvariable=self.tinysa_calibration,state="readonly",width=11,
+            values=tuple(TINYSA_CALIBRATION_OPTIONS),
+        ).grid(row=1,column=4,sticky="w",padx=(5,14),pady=(9,0))
+        ttk.Label(settings,text="집계 방식").grid(row=1,column=5,sticky="w",pady=(9,0))
+        aggregation_box=ttk.Combobox(
+            settings,textvariable=self.tinysa_aggregation,state="readonly",width=21,
+            values=tuple(TINYSA_AGGREGATION_OPTIONS),
+        )
+        aggregation_box.grid(row=1,column=6,columnspan=2,sticky="w",padx=(5,14),pady=(9,0))
+        aggregation_box.bind("<<ComboboxSelected>>",self.on_tinysa_aggregation_change)
+        ttk.Label(settings,text="반복").grid(row=1,column=8,sticky="w",pady=(9,0))
+        self.tinysa_repetition_box=ttk.Spinbox(
+            settings,from_=1,to=32,textvariable=self.tinysa_repetitions,width=6,
+        )
+        self.tinysa_repetition_box.grid(row=1,column=9,sticky="w",padx=(5,0),pady=(9,0))
+        band_shortcuts=ttk.Frame(settings); band_shortcuts.grid(row=2,column=0,columnspan=6,sticky="w",pady=(8,0))
+        ttk.Label(band_shortcuts,text="Wi-Fi 대역").pack(side="left",padx=(0,6))
+        for label,preset_id in (("2.4 GHz","wifi_2_4ghz"),("5 GHz","wifi_5ghz"),("6 GHz","wifi_6ghz")):
+            ttk.Button(
+                band_shortcuts,text=label,
+                command=lambda selected=preset_id:self.select_tinysa_wifi_band(selected),
+            ).pack(side="left",padx=(0,4))
+        actions=ttk.Frame(settings); actions.grid(row=2,column=5,columnspan=7,sticky="e",pady=(8,0))
+        ttk.Checkbutton(
+            actions,text="자동 RF 수집",variable=self.tinysa_auto_enabled,
+        ).pack(side="left",padx=(0,8))
+        ttk.Button(actions,text="장비 확인",command=self.refresh_tinysa_connection).pack(side="left")
+        ttk.Button(actions,text="자동수집 설정 적용",command=self.save_tinysa_config).pack(side="left",padx=5)
+        self.tinysa_all_scan_button=ttk.Button(
+            actions,text="2.4/5/6 GHz 전체 측정",command=self.run_tinysa_all_scan,
+        )
+        self.tinysa_all_scan_button.pack(side="left",padx=(0,5))
+        self.tinysa_scan_button=ttk.Button(actions,text="1회 측정",style="Accent.TButton",command=self.run_tinysa_scan)
+        self.tinysa_scan_button.pack(side="left")
+        self.on_tinysa_aggregation_change()
+
+        metrics=ttk.LabelFrame(tab,text="최근 측정값",padding=9); metrics.pack(fill="x",pady=(10,0))
+        for index,(key,label) in enumerate((
+            ("peak","피크 전력"),("frequency","피크 주파수"),("average","평균 전력"),
+            ("noise","노이즈 플로어"),("occupancy","RF 점유율"),("observed","측정시각"),
+        )):
+            block=ttk.Frame(metrics,style="Surface.TFrame",padding=(6,2)); block.grid(row=0,column=index,sticky="ew",padx=3)
+            variable=tk.StringVar(value="-"); self.tinysa_metric_vars[key]=variable
+            ttk.Label(block,text=label,style="MetricLabel.TLabel").pack(anchor="w")
+            ttk.Label(block,textvariable=variable,style="MetricValue.TLabel").pack(anchor="w",pady=(2,0))
+            metrics.columnconfigure(index,weight=1)
+
+        plot_frame=ttk.LabelFrame(tab,text="주파수별 수신 전력 · 원본 스윕",padding=8); plot_frame.pack(fill="both",expand=True,pady=(10,0))
+        self.tinysa_plot=tk.Canvas(plot_frame,background="#fbfbfc",highlightthickness=0,height=520)
+        self.tinysa_plot.pack(fill="both",expand=True)
+        self.tinysa_plot.bind("<Configure>",lambda _event:self._render_tinysa_plot())
+        ttk.Label(tab,text="가로축은 주파수(MHz/GHz, Hz 기준)이며 AP 대역은 Wi-Fi 채널을 함께 표시합니다. 절대 전력은 안테나 보정 전 값입니다.").pack(anchor="w",pady=(7,0))
+        ttk.Label(tab,text="위성은 안테나 직결 RF가 아니라 LNB 출력 IF(950~2150MHz) 측정용입니다. DC 차단과 입력 레벨 보호를 확인하세요.").pack(anchor="w",pady=(2,0))
+
+    def _set_tinysa_subcategory_values(self):
+        presets=TINYSA_BAND_CATALOG.get(self.tinysa_category.get(), ())
+        labels=tuple(preset["label"] for preset in presets)
+        self.tinysa_subcategory_box.configure(values=labels)
+        if self.tinysa_subcategory.get() not in labels and labels:
+            self.tinysa_subcategory.set(labels[0])
+
+    def on_tinysa_category_change(self, _event=None):
+        self._set_tinysa_subcategory_values()
+        self.apply_tinysa_preset()
+
+    def select_tinysa_wifi_band(self, preset_id):
+        _,preset=tinysa_preset_by_id(preset_id)
+        if not preset:
+            return
+        self.tinysa_category.set("AP")
+        self._set_tinysa_subcategory_values()
+        self.tinysa_subcategory.set(preset["label"])
+        self.apply_tinysa_preset()
+
+    def apply_tinysa_preset(self):
+        preset=tinysa_preset_by_label(self.tinysa_category.get(),self.tinysa_subcategory.get())
+        if not preset:
+            return
+        self.tinysa_band.set(preset["id"])
+        if preset["id"] != "custom":
+            self.tinysa_start_mhz.set(preset["start_mhz"]); self.tinysa_stop_mhz.set(preset["stop_mhz"])
+        self.tinysa_payload=None
+        self.tinysa_multi_payload=None
+        for variable in self.tinysa_metric_vars.values():
+            variable.set("-")
+        self._render_tinysa_plot()
+
+    def on_tinysa_aggregation_change(self, _event=None):
+        single=TINYSA_AGGREGATION_OPTIONS.get(self.tinysa_aggregation.get()) == "single_sweep"
+        if single:
+            self.tinysa_repetitions.set("1")
+        self.tinysa_repetition_box.configure(state="disabled" if single else "normal")
+
+    def _tinysa_settings_from_form(self):
+        settings=normalize_tinysa_settings(
+            self.tinysa_band.get(),self.tinysa_start_mhz.get(),self.tinysa_stop_mhz.get(),
+            self.tinysa_points.get(),self.tinysa_interval.get(),self.tinysa_antenna.get(),self.tinysa_category.get(),
+            TINYSA_CALIBRATION_OPTIONS.get(self.tinysa_calibration.get()),
+            TINYSA_AGGREGATION_OPTIONS.get(self.tinysa_aggregation.get()),self.tinysa_repetitions.get(),
+        )
+        settings["enabled"]=bool(self.tinysa_auto_enabled.get())
+        return settings
+
+    def refresh_tinysa_connection(self):
+        service_state="자동 RF 수집 켜짐" if self.tinysa_auto_enabled.get() else "자동 RF 수집 꺼짐"
+        self.tinysa_status.set(f"장비 응답 확인 중 · {service_state}")
+        self.async_run("tinySA 장비 확인",[
+            "python3",TINYSA_HELPER,"--json","--probe","--device",TINYSA_DEVICE,
+            "--lock-timeout","2","--timeout","5",
+        ],timeout=10)
+
+    def refresh_tinysa_config_state(self):
+        self.async_run(
+            "tinySA 자동수집 상태",
+            ["sudo","-n",TINYSA_CONFIG_HELPER,"--status"],
+            timeout=10,
+        )
+
+    def save_tinysa_config(self):
+        try:
+            settings=self._tinysa_settings_from_form()
+        except ValueError as exc:
+            messagebox.showerror("입력 오류",str(exc)); return
+        self.pending_tinysa_settings=settings
+        self.tinysa_status.set("자동수집 설정 저장 중")
+        self.async_run("tinySA 설정 저장",[
+            "sudo","-n",TINYSA_CONFIG_HELPER,settings["model"],settings["device"],settings["band"],
+            str(settings["start_hz"]),str(settings["stop_hz"]),str(settings["points"]),
+            str(settings["interval_seconds"]),settings["antenna_profile"],settings["calibration_state"],
+            settings["aggregation"],str(settings["sweep_repetitions"]),
+            "true" if settings["enabled"] else "false",
+        ],timeout=45)
+
+    def run_tinysa_scan(self):
+        try:
+            settings=self._tinysa_settings_from_form()
+        except ValueError as exc:
+            messagebox.showerror("입력 오류",str(exc)); return
+        if not Path(settings["device"]).exists():
+            messagebox.showerror("장비 미연결",f"{settings['device']} 장치를 찾을 수 없습니다."); return
+        permission_message=tinysa_permission_message(settings["device"])
+        if permission_message:
+            messagebox.showerror("측정 권한",permission_message); return
+        self.tinysa_scan_button.configure(state="disabled")
+        self.tinysa_status.set("1회 측정 중")
+        self.async_run("tinySA 1회 측정",[
+            "python3",TINYSA_HELPER,"--json","--device",settings["device"],
+            "--lock-timeout","30",
+            "--start-hz",str(settings["start_hz"]),"--stop-hz",str(settings["stop_hz"]),
+            "--points",str(settings["points"]),"--band",settings["band"],
+            "--sweep-repetitions",str(settings["sweep_repetitions"]),
+            "--aggregation",settings["aggregation"],
+            "--sensor-id","tinysa-zs407-400","--device-model",settings["model"],
+            "--antenna-profile",settings["antenna_profile"],
+            "--calibration-state",settings["calibration_state"],
+        ],timeout=min(180,max(45,settings["sweep_repetitions"]*20+10)))
+
+    def run_tinysa_all_scan(self):
+        try:
+            settings=self._tinysa_settings_from_form()
+        except ValueError as exc:
+            messagebox.showerror("입력 오류",str(exc)); return
+        if not Path(settings["device"]).exists():
+            messagebox.showerror("장비 미연결",f"{settings['device']} 장치를 찾을 수 없습니다."); return
+        permission_message=tinysa_permission_message(settings["device"])
+        if permission_message:
+            messagebox.showerror("측정 권한",permission_message); return
+        self.tinysa_all_scan_button.configure(state="disabled")
+        self.tinysa_scan_button.configure(state="disabled")
+        self.tinysa_status.set("2.4/5/6 GHz 연속 측정 중")
+        self.async_run("tinySA 전체 대역 측정",[
+            "python3",TINYSA_HELPER,"--json","--wifi-all","--device",settings["device"],
+            "--lock-timeout","30","--points",str(settings["points"]),
+            "--sweep-repetitions",str(settings["sweep_repetitions"]),
+            "--aggregation",settings["aggregation"],
+            "--sensor-id","tinysa-zs407-400","--device-model",settings["model"],
+            "--antenna-profile",settings["antenna_profile"],
+            "--calibration-state",settings["calibration_state"],
+        ],timeout=min(540,max(120,settings["sweep_repetitions"]*60+30)))
+
+    def _update_tinysa_result(self, payload):
+        if not isinstance(payload,dict) or not payload.get("available"):
+            raise ValueError(payload.get("error","tinySA 측정 결과가 없습니다.") if isinstance(payload,dict) else "tinySA 결과 형식 오류")
+        self.tinysa_payload=payload
+        self.tinysa_multi_payload=None
+        self.tinysa_metric_vars["peak"].set(f"{payload.get('peak_dbm'):.2f} dBm")
+        self.tinysa_metric_vars["frequency"].set(f"{payload.get('peak_frequency_hz') / 1_000_000:.3f} MHz")
+        self.tinysa_metric_vars["average"].set(f"{payload.get('average_dbm'):.2f} dBm")
+        self.tinysa_metric_vars["noise"].set(f"{payload.get('noise_floor_dbm'):.2f} dBm")
+        self.tinysa_metric_vars["occupancy"].set(f"{payload.get('rf_occupancy_pct'):.2f} %")
+        observed=str(payload.get("observed_at") or "").replace("T"," ").replace("Z","")
+        self.tinysa_metric_vars["observed"].set(observed[11:19] if len(observed)>=19 else observed or "-")
+        version=payload.get("device_version") or "펌웨어 미확인"
+        calibration_label=next(
+            (label for label,value in TINYSA_CALIBRATION_OPTIONS.items() if value == payload.get("calibration_state")),
+            "교정 상태 확인 필요",
+        )
+        aggregation_label=next(
+            (label for label,value in TINYSA_AGGREGATION_OPTIONS.items() if value == payload.get("aggregation")),
+            payload.get("aggregation") or "방식 확인 필요",
+        )
+        repetitions=payload.get("sweep_repetitions") or 1
+        self.tinysa_status.set(f"연결됨 · {version} · {calibration_label} · {aggregation_label} {repetitions}회")
+        self._render_tinysa_plot()
+
+    def _update_tinysa_multi_result(self, payload):
+        bands=payload.get("bands") if isinstance(payload,dict) else None
+        if not bands or len(bands) != 3:
+            raise ValueError("전체 대역 측정 결과가 올바르지 않습니다.")
+        self.tinysa_payload=None
+        self.tinysa_multi_payload=payload
+        peak=max(bands,key=lambda item:item.get("peak_dbm",float("-inf")))
+        self.tinysa_metric_vars["peak"].set(f"{peak.get('peak_dbm'):.2f} dBm")
+        self.tinysa_metric_vars["frequency"].set(f"{peak.get('peak_frequency_hz') / 1_000_000:.3f} MHz")
+        self.tinysa_metric_vars["average"].set("대역별 그래프")
+        self.tinysa_metric_vars["noise"].set("대역별 그래프")
+        self.tinysa_metric_vars["occupancy"].set("대역별 그래프")
+        self.tinysa_metric_vars["observed"].set("연속 측정")
+        elapsed=payload.get("sweep_duration_ms",0) / 1000
+        self.tinysa_status.set(f"2.4/5/6 GHz 측정 완료 · 순차 스윕 {elapsed:.1f}초")
+        self._render_tinysa_plot()
+
+    def _render_tinysa_plot(self):
+        canvas=getattr(self,"tinysa_plot",None)
+        if not canvas:
+            return
+        canvas.delete("all")
+        width=max(300,canvas.winfo_width()); height=max(180,canvas.winfo_height())
+        multi=(self.tinysa_multi_payload or {}).get("bands") or []
+        if multi:
+            panel_height=max(155,height/3)
+            for index,payload in enumerate(multi):
+                self._render_tinysa_plot_panel(canvas,payload,width,index*panel_height,panel_height)
+            return
+        payload=self.tinysa_payload or {}
+        self._render_tinysa_plot_panel(canvas,payload,width,0,height)
+
+    def _render_tinysa_plot_panel(self,canvas,payload,width,offset_y,panel_height):
+        left,right,top,bottom=58,18,offset_y+38,36
+        frequencies=payload.get("frequency_hz") or []; powers=payload.get("power_dbm") or []
+        if len(frequencies)<2 or len(frequencies)!=len(powers):
+            canvas.create_text(width/2,offset_y+panel_height/2,text="측정을 실행하면 원본 스펙트럼이 표시됩니다.",fill=self.colors["muted"])
+            return
+        minimum=min(powers); maximum=max(powers)
+        padding=max(3.0,(maximum-minimum)*0.12)
+        low,high=minimum-padding,maximum+padding
+        plot_width=max(1,width-left-right); plot_height=max(1,panel_height-(top-offset_y)-bottom)
+        for index in range(5):
+            y=top+plot_height*index/4
+            value=high-(high-low)*index/4
+            canvas.create_line(left,y,width-right,y,fill="#e1e1e6")
+            canvas.create_text(left-7,y,text=f"{value:.0f}",anchor="e",fill=self.colors["muted"],font=("Noto Sans CJK KR",8))
+        start,stop=frequencies[0],frequencies[-1]
+        _,preset=tinysa_preset_by_id(payload.get("band") or self.tinysa_band.get())
+        axis_mode=(preset or {}).get("axis","frequency")
+        axis_summary=frequency_axis_summary(start,stop,axis_mode)
+        canvas.create_text(
+            left,offset_y+5,
+            text=(
+                f"{axis_summary['label']}  |  {axis_summary['range_label']}"
+                f"  |  격자 {format_frequency(axis_summary['grid_step_hz'])}"
+            ),
+            anchor="nw",fill=self.colors["text"],font=("Noto Sans CJK KR",9,"bold"),
+        )
+        for frequency,_label in frequency_axis_ticks(start,stop,axis_mode):
+            x=left+(frequency-start)/(stop-start)*plot_width
+            canvas.create_line(x,top,x,top+plot_height,fill="#d9dce3")
+            tick_text=format_frequency(frequency)
+            canvas.create_text(x,top+plot_height+7,text=tick_text,anchor="n",justify="center",fill=self.colors["muted"],font=("Noto Sans CJK KR",8))
+        maximum_channel_ticks=max(7,min(16,int(plot_width/48)))
+        for frequency,label in wifi_channel_axis_ticks(start,stop,axis_mode,maximum_channel_ticks):
+            x=left+(frequency-start)/(stop-start)*plot_width
+            canvas.create_line(x,top,x,top+plot_height,fill="#bfd4f6",dash=(2,4))
+            canvas.create_text(
+                x,top-5,text=label,anchor="s",fill=self.colors["metro_blue"],
+                font=("Noto Sans CJK KR",8,"bold"),
+            )
+        points=[]
+        for frequency,power in zip(frequencies,powers):
+            x=left+(frequency-start)/(stop-start)*plot_width
+            y=top+(high-power)/(high-low)*plot_height
+            points.extend((x,y))
+        canvas.create_line(*points,fill=self.colors["metro_blue"],width=2)
+        peak_index=powers.index(maximum)
+        peak_x,peak_y=points[peak_index*2],points[peak_index*2+1]
+        canvas.create_oval(peak_x-3,peak_y-3,peak_x+3,peak_y+3,fill=self.colors["metro_red"],outline="")
+
     def _measurement_tab(self):
         tab=self._new_page("측정 세션")
-        controls=ttk.LabelFrame(tab,text="반복 측정 설정",padding=10); controls.pack(fill="x")
+        controls=ttk.LabelFrame(tab,text="동시 측정 설정",padding=10); controls.pack(fill="x")
         ttk.Label(controls,text="측정시간").grid(row=0,column=0,sticky="w")
         ttk.Spinbox(controls,from_=1,to=28800,textvariable=self.measurement_value,width=8).grid(row=0,column=1,padx=(5,3))
         ttk.Combobox(controls,textvariable=self.measurement_unit,state="readonly",width=7,values=("초","분","시간")).grid(row=0,column=2,padx=(0,15))
         ttk.Label(controls,text="측정간격(초)").grid(row=0,column=3,sticky="w")
         ttk.Spinbox(controls,from_=2,to=300,textvariable=self.measurement_interval,width=8).grid(row=0,column=4,padx=5)
-        ttk.Button(controls,text="측정 시작",command=self.start_measurement).grid(row=0,column=5,padx=(12,4))
-        ttk.Label(controls,text="게이트웨이·국내 KT DNS·해외 Google DNS, CPU·메모리·디스크, 인터페이스 송수신 속도를 반복 측정합니다.").grid(row=1,column=0,columnspan=6,sticky="w",pady=(9,0))
-        ttk.Label(controls,text="결과는 먼저 이 수집기에 저장되고, 중앙 NMS 연결 시 단위·측정시각·시도/성공/실패 수와 최소·평균·최대값으로 전송됩니다.").grid(row=2,column=0,columnspan=6,sticky="w",pady=(4,0))
-        ttk.Label(controls,textvariable=self.active_profile_label).grid(row=3,column=0,columnspan=5,sticky="w",pady=(8,0))
-        ttk.Button(controls,text="현장 프로필",command=lambda:self.show_page("현장 프로필")).grid(row=3,column=5,sticky="e",pady=(8,0))
+        ttk.Button(controls,text="동시 측정 시작",style="Accent.TButton",command=self.start_measurement).grid(row=0,column=5,padx=(12,4))
+        modules=ttk.Frame(controls); modules.grid(row=1,column=0,columnspan=6,sticky="w",pady=(10,0))
+        labels={"wired":"유선","wireless":"무선","rf":"RF 스펙트럼","packet_capture":"패킷 캡처","system":"시스템"}
+        for key in ("wired","wireless","rf","packet_capture","system"):
+            ttk.Checkbutton(modules,text=labels[key],variable=self.measurement_module_vars[key]).pack(side="left",padx=(0,12))
+        actions=ttk.Frame(controls); actions.grid(row=2,column=0,columnspan=6,sticky="ew",pady=(10,0))
+        ttk.Button(actions,text="일시 정지",command=lambda:self.control_measurement("pause")).pack(side="left")
+        ttk.Button(actions,text="계속",command=lambda:self.control_measurement("resume")).pack(side="left",padx=5)
+        ttk.Button(actions,text="안전 중지",command=lambda:self.control_measurement("stop")).pack(side="left")
+        ttk.Button(actions,text="결과/상태 새로고침",command=self.refresh_measurement_session).pack(side="left",padx=5)
+        ttk.Label(actions,textvariable=self.measurement_status).pack(side="right")
+        ttk.Label(controls,text="게이트웨이·KT/Google DNS, 유선·무선 품질, RF 2.4/5/6GHz 순환, 시스템 상태를 같은 측정 세션 ID와 시간축으로 저장합니다.").grid(row=3,column=0,columnspan=6,sticky="w",pady=(9,0))
+        ttk.Label(controls,text="모듈 하나가 실패해도 성공한 측정은 보존되며 최종 상태는 완료·부분완료·실패로 구분됩니다.").grid(row=4,column=0,columnspan=6,sticky="w",pady=(4,0))
+        ttk.Label(controls,textvariable=self.active_profile_label).grid(row=5,column=0,columnspan=5,sticky="w",pady=(8,0))
+        ttk.Button(controls,text="현장 프로필",command=lambda:self.show_page("현장 프로필")).grid(row=5,column=5,sticky="e",pady=(8,0))
         self.measurement_output=tk.Text(tab,wrap="none",state="disabled",font=("monospace",10)); self.measurement_output.pack(fill="both",expand=True,pady=(10,0))
 
     def measurement_seconds(self):
@@ -764,6 +1580,15 @@ class App:
         return value*multiplier, interval
 
     def start_measurement(self):
+        if not os.path.isfile(MEASUREMENT_SESSION) or not os.path.isfile(MEASUREMENT_CONTROL):
+            self.measurement_status.set("동시 측정 실행 모듈 누락")
+            messagebox.showerror(
+                "설치 복구 필요",
+                "동시 측정 실행 모듈이 설치되지 않았습니다.\n"
+                "수집기 설치 패키지를 다시 적용한 뒤 프로그램을 재실행하세요.\n\n"
+                f"필요 파일: {MEASUREMENT_SESSION}\n{MEASUREMENT_CONTROL}",
+            )
+            return
         duration,interval=self.measurement_seconds()
         if duration is None or not 10 <= duration <= 28800: messagebox.showerror("입력 오류","측정시간은 10초~8시간입니다."); return
         if not 2 <= interval <= 300: messagebox.showerror("입력 오류","측정간격은 2~300초입니다."); return
@@ -772,14 +1597,61 @@ class App:
         if not profile:
             self.show_page("현장 프로필")
             return
-        if not messagebox.askyesno("측정 시작",f"{profile['site_name']}에서 {duration}초 동안 {interval}초 간격으로 측정할까요?"): return
+        selected=[key for key,variable in self.measurement_module_vars.items() if variable.get()]
+        if not selected: messagebox.showerror("입력 오류","측정 모듈을 하나 이상 선택하세요."); return
+        if not messagebox.askyesno("동시 측정 시작",f"{profile['site_name']}에서 {duration}초 동안 유선·무선·RF 데이터를 같은 시간축으로 측정할까요?"): return
         self.pending_measurement_profile = profile
-        self.privileged(
-            [NODE,COLLECTOR,"measurement-session",str(duration),str(interval),"--field-profile-stdin"],
+        self.measurement_status.set("세션 생성 및 장비 사전 점검 중")
+        self.async_run(
+            "동시 측정 시작",
+            [
+                "sudo","-n",MEASUREMENT_CONTROL,"start",
+                "--duration",str(duration),
+                "--interval",str(interval),
+                "--modules",",".join(selected),
+            ],
             json.dumps(profile, ensure_ascii=False),
-            label="측정 세션",
-            timeout=duration+180
+            timeout=180
         )
+
+    def control_measurement(self, action):
+        if not os.path.isfile(MEASUREMENT_SESSION) or not os.path.isfile(MEASUREMENT_CONTROL):
+            self.measurement_status.set("동시 측정 실행 모듈 누락")
+            messagebox.showerror("설치 복구 필요",f"누락 파일: {MEASUREMENT_SESSION}")
+            return
+        labels={"pause":"동시 측정 일시정지","resume":"동시 측정 계속","stop":"동시 측정 안전중지"}
+        if action=="stop" and not messagebox.askyesno("안전 중지","현재 동시 측정을 안전하게 종료할까요?"):
+            return
+        self.async_run(labels[action],["sudo","-n",MEASUREMENT_CONTROL,action],timeout=60)
+
+    def refresh_measurement_session(self):
+        if not os.path.isfile(MEASUREMENT_SESSION):
+            self.measurement_status.set("동시 측정 실행 모듈 누락")
+            return
+        self.async_run(
+            "동시 측정 상태",
+            ["sudo","-n",MEASUREMENT_CONTROL,"status"],
+            timeout=30,
+        )
+
+    def _update_measurement_session_status(self, payload):
+        state=payload.get("status") or "unknown"
+        labels={
+            "idle":"대기","preflight":"사전 점검","running":"측정 중","paused":"일시 정지",
+            "stopping":"안전 종료 중","completed":"완료","partial":"부분 완료",
+            "failed":"실패","cancelled":"취소",
+        }
+        session_id=str(payload.get("measurement_session_id") or "")
+        suffix=f" · {session_id[:8]}" if session_id else ""
+        terminal=state in ("completed","partial","failed","cancelled")
+        worker="" if terminal or payload.get("worker_alive",True) else " · 작업 프로세스 확인 필요"
+        preflight=payload.get("preflight") or {}
+        clock=preflight.get("clock") if isinstance(preflight,dict) else {}
+        ntp_state=(clock or {}).get("ntp_state") or preflight.get("ntp_state")
+        clock_warning=""
+        if ntp_state in ("degraded","unsynced","unknown"):
+            clock_warning=f" · 시간동기화 {ntp_state}"
+        self.measurement_status.set(f"{labels.get(state,state)}{suffix}{clock_warning}{worker}")
 
     def _offline_queue_tab(self):
         tab=self._new_page("저장/전송")
@@ -883,6 +1755,7 @@ class App:
         self.live_stop_button=ttk.Button(controls,text="중지",command=self.stop_live_capture,state="disabled")
         self.live_stop_button.grid(row=0,column=7)
         ttk.Label(controls,textvariable=self.live_capture_status).grid(row=1,column=0,columnspan=8,sticky="w",pady=(8,0))
+        ttk.Label(controls,textvariable=self.live_flood_status,wraplength=1040).grid(row=2,column=0,columnspan=8,sticky="w",pady=(4,0))
 
         live=ttk.LabelFrame(tab,text="실시간 패킷 헤더",padding=8); live.pack(fill="both",expand=True,pady=(10,0))
         self.live_capture_tree=ttk.Treeview(live,columns=("time","source","destination","protocol","length","info"),show="headings",height=9)
@@ -1001,12 +1874,19 @@ class App:
         for row in self.live_capture_tree.get_children(): self.live_capture_tree.delete(row)
         self.live_capture_packet_count=0
         self.live_capture_path=None
+        self.live_flood_counts=empty_counts()
+        self.live_flood_started_at=time.monotonic()
+        self.live_flood_status.set("플러딩 분석 준비 중")
         command=["pkexec",GUI_OPS,"live-capture",self.interface.get(),profile,str(minutes*60)]
         try:
-            self.live_capture_process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1,start_new_session=True)
+            self.live_capture_process=subprocess.Popen(
+                command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                text=True,bufsize=1,start_new_session=True,
+            )
         except OSError as exc:
             messagebox.showerror("실시간 캡처",str(exc)); return
         self.running_jobs+=1
+        self.live_capture_stopping=False
         self.live_start_button.configure(state="disabled")
         self.live_stop_button.configure(state="normal")
         self.live_capture_status.set(f"인증 대기 또는 캡처 시작 중 · 최대 {minutes}분 / 50MB")
@@ -1033,9 +1913,26 @@ class App:
         process=self.live_capture_process
         if not process or process.poll() is not None:
             return
+        if self.live_capture_stopping:
+            return
+        self.live_capture_stopping=True
         self.live_capture_status.set("캡처 종료 중")
-        try: os.killpg(process.pid,signal.SIGINT)
-        except (OSError,ProcessLookupError): process.terminate()
+        self.live_stop_button.configure(state="disabled")
+        self.running_jobs+=1
+        threading.Thread(target=self._stop_live_capture_worker,args=(process,),daemon=True).start()
+
+    def _stop_live_capture_worker(self, process):
+        try:
+            result=subprocess.run(
+                ["pkexec",GUI_OPS,"stop-live-capture",str(process.pid)],
+                capture_output=True,text=True,timeout=15,check=False,
+            )
+            text=(result.stdout or result.stderr or "").strip()
+            self.events.put(("실시간 캡처 종료 요청",result.returncode,text))
+        except subprocess.TimeoutExpired:
+            self.events.put(("실시간 캡처 종료 요청",124,"캡처 종료 명령 시간이 초과되었습니다."))
+        except OSError as exc:
+            self.events.put(("실시간 캡처 종료 요청",1,str(exc)))
 
     def _handle_live_capture_line(self, line):
         if line.startswith("#META\t"):
@@ -1057,6 +1954,29 @@ class App:
         destination=fields[6] or fields[7] or fields[3] or "-"
         self.live_capture_tree.insert("","end",values=(timestamp,source,destination,fields[8] or "-",fields[9] or "-",fields[10] or "-"))
         self.live_capture_packet_count+=1
+        add_packet(
+            self.live_flood_counts,
+            fields[8],
+            fields[3],
+            fields[11] if len(fields)>11 else "",
+            fields[12] if len(fields)>12 else "",
+        )
+        elapsed=time.monotonic()-(self.live_flood_started_at or time.monotonic())
+        flood=summarize_counts(self.live_flood_counts,elapsed)
+        counts=flood["counts"]
+        rates=flood["rates_pps"]
+        state={
+            "candidate":"플러딩 후보 있음",
+            "no_candidate":"기준 초과 없음",
+            "insufficient_data":"판단 자료 부족",
+        }.get(flood["status"],"판단 불가")
+        self.live_flood_status.set(
+            f"{state} · 브로드캐스트 {counts['broadcast']} ({rates['broadcast'] or 0} pps)"
+            f" · 멀티캐스트 {counts['multicast']} ({rates['multicast'] or 0} pps)"
+            f" · ARP {counts['arp']} ({rates['arp'] or 0} pps)"
+            f" · mDNS {counts['mdns']} ({rates['mdns'] or 0} pps)"
+            f" · SSDP {counts['ssdp']} · LLMNR/NBNS {counts['llmnr'] + counts['nbns']}"
+        )
         rows=self.live_capture_tree.get_children()
         if len(rows)>500: self.live_capture_tree.delete(rows[0])
         self.live_capture_tree.yview_moveto(1)
@@ -1119,12 +2039,22 @@ class App:
                     self._handle_live_capture_line(stream_line)
             elif label=="실시간 캡처 완료":
                 self.live_capture_process=None
+                self.live_capture_stopping=False
                 self.live_start_button.configure(state="normal")
                 self.live_stop_button.configure(state="disabled")
                 if code in (0,130,-2,-15):
                     self.live_capture_status.set(f"캡처 완료 · {self.live_capture_packet_count}패킷 · {self.live_capture_path or '저장파일 확인'}")
                 else:
                     self.live_capture_status.set(f"캡처 오류 ({code}) · {text or '권한 또는 인터페이스를 확인하세요'}")
+                if self.closing:
+                    self.root.after(10,self._finish_close)
+            elif label=="실시간 캡처 종료 요청":
+                if code==0:
+                    self.live_capture_status.set("캡처 데이터 정리 중")
+                else:
+                    self.live_capture_stopping=False
+                    self.live_capture_status.set(f"종료 실패 ({code}) · {text[:120]}")
+                    self.live_stop_button.configure(state="normal")
             elif label=="실시간 모니터링":
                 self.live_monitor_in_flight=False
                 if code==0:
@@ -1135,6 +2065,19 @@ class App:
                 if self.live_monitor_enabled:
                     self.live_monitor_after_id=self.root.after(2000,self.refresh_live_monitor)
             elif label=="현황": self._set_text(self.summary,text)
+            elif label=="수집기 이름 저장":
+                if code==0 and self.pending_collector_name:
+                    try:
+                        saved_name=save_collector_name(self.pending_collector_name)
+                        self.collector_name.set(saved_name)
+                        self.collector_name_status.set("중앙 표시명 반영 완료")
+                        messagebox.showinfo("수집기 이름",f"{saved_name}(으)로 변경했습니다.")
+                        self.root.after(500,self.refresh_status)
+                    except (OSError,ValueError) as exc:
+                        self.collector_name_status.set(f"로컬 설정 저장 실패: {exc}")
+                else:
+                    self.collector_name_status.set(f"저장 실패: {text[:120]}")
+                self.pending_collector_name=None
             elif label=="오프라인 큐 조회":
                 if code==0:
                     try:
@@ -1207,10 +2150,89 @@ class App:
                 else:
                     self.last_snapshot.set("최근 저장: 실패 · 진단 로그를 확인하세요")
                     self._set_text(self.measurement_output,f"$ {label}\n{text}\n",append=True)
+            elif label in (
+                "동시 측정 시작","동시 측정 일시정지","동시 측정 계속",
+                "동시 측정 안전중지","동시 측정 상태",
+            ):
+                if code==0:
+                    try:
+                        payload=json.loads(text)
+                        self._update_measurement_session_status(payload)
+                        summary=format_measurement_session_result(payload)
+                        detail=json.dumps(payload,ensure_ascii=False,indent=2)
+                        self._set_text(self.measurement_output,f"{summary}\n\n[상세 JSON]\n{detail}\n")
+                        state=payload.get("status")
+                        if state in ("preflight","running","paused","stopping"):
+                            self.root.after(3000,self.refresh_measurement_session)
+                    except (ValueError,json.JSONDecodeError):
+                        self.measurement_status.set("측정 상태 형식 오류")
+                        self._set_text(self.measurement_output,text+"\n",append=True)
+                else:
+                    self.measurement_status.set(f"{label} 실패")
+                    self._set_text(self.measurement_output,f"$ {label}\n{text}\n",append=True)
+                if label=="동시 측정 시작":
+                    self.pending_measurement_profile=None
             elif label=="SNMP 설정 조회" and code==0:
                 data=parse_settings(text); self.version.set(data.get("version","2c")); self.port.set(data.get("port",161)); self.timeout.set(data.get("timeout",2)); self.retries.set(data.get("retries",1)); self.community_state.set("Community: 설정됨" if data.get("community_configured") else "Community: 미설정")
                 for x in self.tree.get_children():self.tree.delete(x)
                 for t in data["targets"]:self.tree.insert("","end",values=(t.get("name",""),t.get("host",""),t.get("role","switch")))
+            elif label=="tinySA 장비 확인":
+                try:
+                    payload=json.loads(text)
+                except (ValueError,json.JSONDecodeError):
+                    payload={"error":text or "응답 없음","error_code":"measurement_failed"}
+                service_state="자동 RF 수집 켜짐" if self.tinysa_auto_enabled.get() else "자동 RF 수집 꺼짐"
+                if code==0 and payload.get("available"):
+                    version=payload.get("device_version") or "펌웨어 확인"
+                    self.tinysa_status.set(f"장비 정상 · {version[:55]} · {service_state}")
+                else:
+                    self.tinysa_status.set(f"{tinysa_error_message(payload)} · {service_state}")
+            elif label=="tinySA 자동수집 상태":
+                if code==0:
+                    try:
+                        payload=json.loads(text)
+                        enabled=bool(payload.get("enabled"))
+                        self.tinysa_auto_enabled.set(enabled)
+                        state="켜짐" if enabled else "꺼짐"
+                        self.tinysa_status.set(f"자동 RF 수집 {state}")
+                    except (ValueError,json.JSONDecodeError):
+                        self.tinysa_status.set("자동 RF 수집 상태 확인 실패")
+            elif label=="tinySA 설정 저장":
+                if code==0 and self.pending_tinysa_settings:
+                    save_tinysa_settings(self.pending_tinysa_settings)
+                    state="켜짐" if self.pending_tinysa_settings.get("enabled") else "꺼짐"
+                    self.tinysa_status.set(f"설정 저장 완료 · 자동 RF 수집 {state}")
+                    self.root.after(500,self.refresh_tinysa_connection)
+                else:
+                    self.tinysa_status.set(f"설정 저장 실패: {text[:120]}")
+                self.pending_tinysa_settings=None
+            elif label=="tinySA 1회 측정":
+                self.tinysa_scan_button.configure(state="normal")
+                if code==0:
+                    try:
+                        self._update_tinysa_result(json.loads(text))
+                    except (ValueError,TypeError,json.JSONDecodeError) as exc:
+                        self.tinysa_status.set(f"측정 결과 오류: {exc}")
+                else:
+                    try:
+                        payload=json.loads(text)
+                    except (ValueError,json.JSONDecodeError):
+                        payload={"error":text[:160],"error_code":"measurement_failed"}
+                    self.tinysa_status.set(f"측정 실패: {tinysa_error_message(payload)}")
+            elif label=="tinySA 전체 대역 측정":
+                self.tinysa_all_scan_button.configure(state="normal")
+                self.tinysa_scan_button.configure(state="normal")
+                if code==0:
+                    try:
+                        self._update_tinysa_multi_result(json.loads(text))
+                    except (ValueError,TypeError,json.JSONDecodeError) as exc:
+                        self.tinysa_status.set(f"전체 대역 결과 오류: {exc}")
+                else:
+                    try:
+                        payload=json.loads(text)
+                    except (ValueError,json.JSONDecodeError):
+                        payload={"error":text[:160],"error_code":"measurement_failed"}
+                    self.tinysa_status.set(f"전체 대역 측정 실패: {tinysa_error_message(payload)}")
             elif label=="무선 분석":
                 if code==0:
                     try:
@@ -1296,9 +2318,27 @@ class App:
         self.queue_status.set(f"미전송 {pending}건")
 
     def on_close(self):
+        if self.closing:
+            return
+        self.closing=True
         self.stop_live_monitor()
-        self.stop_live_capture()
-        self.root.after(100,self.root.destroy)
+        process=self.live_capture_process
+        if process and process.poll() is None:
+            self.close_deadline=time.monotonic()+15
+            self.stop_live_capture()
+            self.root.after(100,self._finish_close)
+            return
+        self.root.destroy()
+
+    def _finish_close(self):
+        process=self.live_capture_process
+        if not process or process.poll() is not None:
+            self.root.destroy()
+            return
+        if self.close_deadline and time.monotonic() >= self.close_deadline:
+            self.root.destroy()
+            return
+        self.root.after(100,self._finish_close)
 
 if __name__ == "__main__":
     root=tk.Tk(); App(root); root.mainloop()

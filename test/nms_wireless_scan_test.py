@@ -41,6 +41,19 @@ class WirelessScanTest(unittest.TestCase):
         self.assertEqual(summary["channel_load"][0]["level"], "높음")
         self.assertTrue(any("숨김 SSID" in text for text in summary["recommendations"]))
 
+    def test_hidden_local_bssid_is_related_to_visible_ap_without_claiming_identity(self):
+        rows = self.mod.parse_nmcli_wifi(
+            "wlan1: :metro:5C\\:62\\:8B\\:07\\:C3\\:CF:36:5180 MHz:100:WPA2\n"
+            "wlan1: ::62\\:62\\:8B\\:07\\:C3\\:CF:36:5180 MHz:97:WPA2\n"
+        )
+        visible = next(row for row in rows if row["ssid"] == "metro")
+        hidden = next(row for row in rows if row["hidden"])
+        self.assertIn("상한값", visible["signal_interpretation"])
+        self.assertEqual(hidden["mac_address_type"], "locally_administered")
+        self.assertEqual(hidden["related_bssid"], "5C:62:8B:07:C3:CF")
+        self.assertEqual(hidden["related_ssid"], "metro")
+        self.assertIn("동일 AP", hidden["identity_interpretation"])
+
 
 if __name__ == "__main__":
     unittest.main()

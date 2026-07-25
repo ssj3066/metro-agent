@@ -9,7 +9,9 @@
 - `install-node-lts.sh`
 - `nms-collector.js`
 - `nms-packet-capture.sh`
+- `nms_packet_flood.py`
 - `nms-wireless-scan.py`
+- `install-wireless-adapter-support.sh`
 - `summarize-syn-sources.sh`
 - `heartbeat.sh` (compatibility wrapper)
 - `ensure-collector-autostart.sh`
@@ -77,6 +79,12 @@
 설치 스크립트는 현장 진단에 필요한 `ethtool`, `iperf3`, `mtr`,
 `arp-scan`, `nmap`, `tshark`, `lldpd`, 무선 진단 도구도 함께 설치합니다.
 `iperf3` 서버는 자동 실행하지 않으며 LLDP는 기본적으로 수신 전용입니다.
+
+동시 측정 세션에서 RF 모듈을 선택하면 평상시 자동수집의 단일 `TINYSA_BAND`
+설정과 별개로 2.4GHz, 5GHz, 6GHz Wi-Fi 대역을 순환 측정합니다.
+`TINYSA_SESSION_BANDS`로 순환 대역을 제한할 수 있고, 각 sweep에는 실제
+대역과 시작·종료 주파수가 저장됩니다. 짧은 세션에서도 대역을 한 번씩
+확인할 수 있도록 세션용 Max Hold 반복 기본값은 2회입니다.
 Ubuntu 기본 Node.js 패키지 대신 공식 Node.js LTS 바이너리를 SHA-256 검증 후
 `/opt`에 설치하고 `/usr/local/bin/node`를 서비스 실행 경로로 사용합니다.
 진단 도구만 별도로 다시 구성할 때는 다음을 실행합니다.
@@ -161,13 +169,30 @@ Ubuntu Desktop GUI의 `현장 프로필`은 119 ICT Manager에서 이 장치에 
 
 GUI는 Metro 색상 체계와 좌측 탐색을 사용하는 현장 작업 화면입니다. 상단의 `진단 저장`은 VLAN, LLDP, ARP, 무선, 인터페이스, SNMP, VPN, 수집 서비스와 시스템 상태를 하나의 시각 기준 스냅샷으로 로컬 대기열에 저장합니다. `저장 후 송신`은 동일 파일을 33 NMS와 119 ICT Manager에 각각 저장하고, `중앙 송신`은 두 시스템의 기존 미전송 파일을 재전송합니다. 전송용 세션은 원천, 단위, 측정시각과 수집 가능 상태만 제한된 크기로 담고, 상세 원천 스냅샷은 로컬 `0600` 큐 파일에 유지합니다.
 
+`수집기 현황` 화면의 `수집기 이름`은 사용자가 수정할 수 있습니다. 기본 이름은 `메트로정보통신 네트워크 현장 분석기`이며, 저장하면 root 전용 `collector.env`를 timestamp 백업한 뒤 `COLLECTOR_NAME`을 갱신하고 heartbeat를 즉시 전송합니다. 이 값은 장치 OS 호스트명과 분리된 33 NMS 표시명입니다.
+
 `수집 소스` 화면은 Syslog, SNMP polling/trap, NetFlow, IPFIX, sFlow, DHCP/DNS 관측, 능동 진단, Omada API, endpoint collector를 `수집 중`, `사용 가능`, `설정됨`, `미설정`, `미수집`으로 구분합니다. 포트나 설정이 없는 원천은 정상으로 간주하지 않습니다. `전체 새로고침`은 현재 네트워크, VPN, 서비스, 무선, 오프라인 큐를 함께 갱신하며 완료 시각과 오류 건수를 표시합니다.
 
 `실시간 모니터링` 화면은 선택 인터페이스의 커널 누적 counter를 2초 간격으로 차분해 수신·송신 Mbps와 PPS를 표시합니다. 누적 오류·드롭, 게이트웨이 ICMP 지연, 활성 연결 수, 현재 주소와 링크 상태도 함께 표시합니다. `lldpd`는 receive-only `-r -c`로 실행해 LLDP와 Cisco CDP를 모두 수신하며, 이웃 표에는 원천 프로토콜, 로컬 포트, 장비명, 관리 IP, 상대 포트와 관측 경과를 구분해 표시합니다. 일반 access 포트에서는 직접 연결된 이웃 광고만 볼 수 있으며, 스위치에서 LLDP/CDP가 비활성화된 경우 0건은 정상 판정이 아니라 미관측입니다.
 
-`패킷 캡처` 화면의 실시간 모드는 TShark 헤더 요약을 연속 표시하면서 `/var/log/nms-pcap/live-*.pcapng`에 원본을 저장합니다. 임의 BPF 입력 대신 전체 헤더, 기본 통신, DNS, DHCP, ARP, Ping, LLDP/CDP 프로필만 제공하며 최대 30분, 50MB, 패킷당 256바이트에서 자동 종료됩니다. 화면에는 최근 500개 헤더만 유지합니다. 중지 버튼은 캡처 프로세스 그룹에 종료 신호를 보내고, 완료된 파일은 `adm` 그룹 읽기와 `0640` 권한으로 보관합니다.
+`패킷 캡처` 화면의 실시간 모드는 TShark 헤더 요약을 연속 표시하면서 `/var/log/nms-pcap/live-*.pcapng`에 원본을 저장합니다. 임의 BPF 입력 대신 전체 헤더, 플러딩 분석, 기본 통신, DNS, DHCP, ARP, Ping, LLDP/CDP 프로필만 제공하며 최대 30분, 50MB, 패킷당 256바이트에서 자동 종료됩니다. 화면에는 최근 500개 헤더만 유지합니다. 중지 버튼은 캡처 프로세스 그룹에 종료 신호를 보내고, 완료된 파일은 `adm` 그룹 읽기와 `0640` 권한으로 보관합니다.
+
+플러딩 분석은 Broadcast, Multicast, ARP, mDNS, SSDP, LLMNR, NBNS, DHCP를 개수, 비율, pps로 집계합니다. 프로토콜 디코딩이 UDP로만 표시되는 경우에도 표준 UDP 포트로 다시 분류합니다. 관측시간 5초 또는 패킷 20개 미만이면 임계값 판정을 하지 않고 `판단 자료 부족`으로 표시합니다. pps 임계값 초과는 `플러딩 후보`이며 확정 장애가 아닙니다. 전체 현장 판단에는 스위치 SPAN/미러 포트 또는 트렁크 관측이 필요합니다.
 
 GUI의 `무선 분석` 탭은 NetworkManager Wi-Fi 스캔을 다시 실행해 SSID, 숨김 SSID, BSSID, 대역, 채널, 주파수, 신호율, 보안 방식을 표시합니다. 숨김 SSID는 이름을 추정하지 않고 `(숨김 SSID)`와 BSSID·채널로만 표시합니다. 대역별 AP 수, 채널별 검출/강한 신호 수, 현재 연결 AP 신호 품질을 바탕으로 혼잡 가능성과 현장 확인 항목을 안내하며, 원본 결과는 사용자 Documents 아래 JSON으로 저장할 수 있습니다. 이 기능은 Wi-Fi AP 스캔 기준이며, 비 Wi-Fi 간섭원까지 측정하는 RF 스펙트럼 분석을 대체하지 않습니다.
+
+`RF 스펙트럼` 탭은 측정 목적을 `AP`, `방송`, `가전`, `사용자 정의` 대분류로 나누고 각 대분류의 중분류 프리셋을 제공합니다. AP의 2.4/5/6GHz 스윕 그래프는 주파수(MHz/GHz, 내부 Hz 기준)와 Wi-Fi 채널 번호를 가로축에 함께 표시합니다. 방송과 가전은 FM, VHF/UHF 방송, 위성 LNB 출력 IF, NFC/RFID, 433/900MHz 소출력, 2.4/5.8GHz 데이터 기기 범위를 선택할 수 있습니다. 위성 프리셋은 위성 안테나의 고주파 신호 직결용이 아니라 LNB가 변환한 950~2150MHz IF 동축 경로용이며, DC 차단과 입력 레벨 보호를 먼저 확인해야 합니다.
+
+RF 화면의 기본 AP 대역은 5GHz(5150~5850MHz)입니다. `자동 RF 수집`을
+해제하고 설정을 적용하면 AP 검색과 유무선 품질 수집은 유지한 채 tinySA
+자동 스윕만 중지됩니다. `2.4/5/6 GHz 전체 측정`은 한 대의 tinySA로 세
+대역을 빠르게 순차 스윕하고 각 측정시각을 보존한 뒤 한 화면에 함께
+표시합니다.
+
+`측정 세션`의 시작, 상태, 일시정지, 재개, 안전중지는
+`measurement-session-control.sh`의 검증된 인수만 비밀번호 없이 실행할 수
+있습니다. GUI가 root 전용 `collector.env`나 상태 저장소를 직접 읽지 않으므로
+데스크톱 로그인 사용자의 파일 권한과 관계없이 같은 제어 경로를 사용합니다.
 
 `측정 세션`은 10초~8시간의 측정시간과 2~300초의 간격을 지정합니다. 게이트웨이, KT DNS `168.126.63.1`, Google DNS `8.8.8.8`, CPU, 메모리, 루트 디스크, 인터페이스 송수신 속도를 반복 측정합니다. 지연 평균은 성공 표본만 사용하지만 시도/성공/실패 수를 함께 저장하며, 인터페이스 Mbps는 누적 바이트가 아니라 측정 간 counter delta로 계산합니다. 결과에는 원천 측정시각과 33번 적재시각이 분리됩니다.
 
@@ -364,3 +389,66 @@ Launcher command:
 ```
 
 The GUI is an operator convenience layer. Heartbeat, edge analysis, and remote diagnostics remain centrally recorded by NMS 33 and visualized in Grafana; local GUI output is not treated as authoritative history until it is submitted through the central diagnostic workflow.
+
+## Wired, Wi-Fi and tinySA timeline analysis
+
+`WIFI_ANALYSIS_ENABLED=true` enables `nms-wifi-analysis.service` independently
+from heartbeat. It binds Ping to the configured wired and Wi-Fi interfaces,
+collects BSSID/channel/RSSI/link speed with `iw`, and keeps a 15-minute local
+ring. A Ping whose egress interface cannot be verified is stored as
+`route_unverified` and is not used as valid path evidence.
+
+Normal connectivity is reduced to a configurable representative interval.
+When latency, loss, RSSI, BSSID or RF triggers fire, the agent preserves the
+five minutes before and after the event. Offline batches remain under
+`/var/lib/nms-collector/wifi-analysis/queue`.
+
+tinySA is optional. Keep `TINYSA_ENABLED=false` until the USB device, supported
+band and antenna profile are verified. A single sweep cannot prove that no
+short pulse occurred, so unavailable pulse evidence remains `null`. tinySA
+power dBm and Wi-Fi RSSI are not treated as the same absolute measurement.
+The helper enables Ultra mode before every sweep whose stop frequency exceeds
+900 MHz. The GUI stores operator-confirmed antenna and level-calibration
+profiles instead of inferring calibration from the serial console.
+Wi-Fi presets use eight frequency-aligned sweeps and store their pointwise
+maximum as an explicit `max_hold` record so short AP transmissions are less
+likely to be missed. Non-Wi-Fi presets default to one raw sweep.
+The RF GUI can switch between `single_sweep`, `max_hold`, `average`, and
+`min_hold` and set 1-32 repetitions. The selected mode and actual repetition
+count are written into the normalized source metadata.
+
+The Wi-Fi scan inventories USB wireless hardware and reads the actual frequency
+list from `iw phy`. A missing 5/6 GHz result is reported as unsupported when no
+active radio can scan that band, instead of being reported as "no AP". USB
+devices without a bound interface are retained as `driver_missing`, so newly
+attached adapters remain visible to the operator. The pinned RTL8832BU/RTL8852BU
+support installer can be run for known Realtek USB IDs:
+
+```bash
+sudo /opt/nms-collector/install-wireless-adapter-support.sh
+```
+
+RTL8852BU is dual-band 2.4/5 GHz hardware. A separate Wi-Fi 6E/7 adapter whose
+Linux driver exposes 6 GHz frequencies is required for 6 GHz AP scanning.
+The RF "장비 확인" action opens the serial device and verifies the tinySA
+firmware response. It distinguishes missing device, permission, busy, timeout,
+dependency, and protocol errors. Stable `/dev/tinysa4` and `/dev/serial/by-id`
+paths are preferred over transient `ttyACM*` names.
+
+The RF page provides direct 2.4 GHz, 5 GHz, and 6 GHz Wi-Fi band selectors.
+Its spectrum chart uses regular frequency grid intervals (10 MHz, 100 MHz,
+and 200 MHz respectively) and overlays Wi-Fi channel-center guides as a
+separate dashed layer. Frequency and channel labels are not treated as the
+same axis value.
+
+The installer adds the desktop operator to `dialout` and installs
+`70-metro-tinysa.rules` with both the `dialout` group and the active-session
+`uaccess` tag. If the desktop was already logged in when the group was added,
+sign out once and sign in again. A GUI process started by the old login session
+cannot inherit the newly added supplementary group.
+
+```bash
+node /opt/nms-collector/nms-wifi-analysis.js doctor
+systemctl status nms-wifi-analysis.service
+journalctl -u nms-wifi-analysis.service -n 100 --no-pager
+```
