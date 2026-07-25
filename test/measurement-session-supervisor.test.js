@@ -6,6 +6,7 @@ const path = require('path');
 
 const {
     classifyClockState,
+    controlSignals,
     interruptedModuleResult,
     normalizeModuleSelection,
     parseChronyTracking,
@@ -80,6 +81,16 @@ test('safe stop closes running modules without calling them failed', () => {
         interruptedModuleResult('operator_stop', { status: 'completed' }),
         null
     );
+});
+
+test('safe stop wakes a paused worker before requesting termination', () => {
+    assert.deepEqual(controlSignals('stop', { paused_at: '2026-07-25T11:40:18Z' }), [
+        'SIGCONT',
+        'SIGTERM'
+    ]);
+    assert.deepEqual(controlSignals('stop', { paused_at: null }), ['SIGTERM']);
+    assert.deepEqual(controlSignals('pause', {}), ['SIGSTOP']);
+    assert.deepEqual(controlSignals('resume', {}), ['SIGCONT']);
 });
 
 test('measurement session requires explicit network RF band coverage', () => {

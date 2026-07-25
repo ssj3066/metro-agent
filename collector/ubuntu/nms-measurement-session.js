@@ -527,6 +527,15 @@ function interruptedModuleResult(reason, moduleRun, sampleCount = 0) {
     };
 }
 
+function controlSignals(action, state = {}) {
+    if (action === 'pause') return ['SIGSTOP'];
+    if (action === 'resume') return ['SIGCONT'];
+    if (action === 'stop') {
+        return state.paused_at ? ['SIGCONT', 'SIGTERM'] : ['SIGTERM'];
+    }
+    throw new Error(`unsupported control action: ${action}`);
+}
+
 async function finalizeWorker(env, paths, state, reason = 'natural_completion') {
     if (state.finalizing) return state;
     state.finalizing = true;
@@ -719,11 +728,7 @@ async function controlSession(env, action) {
     if (!processAlive(state.worker_pid)) {
         throw new Error(`measurement session worker is not running (pid=${state.worker_pid || 'missing'})`);
     }
-    const signal = action === 'pause' ? 'SIGSTOP'
-        : action === 'resume' ? 'SIGCONT'
-            : action === 'stop' ? 'SIGTERM'
-                : null;
-    if (!signal) throw new Error(`unsupported control action: ${action}`);
+    const signals = controlSignals(action, state);
     await nmsRequest(
         env,
         'PATCH',
@@ -737,7 +742,9 @@ async function controlSession(env, action) {
     if (action === 'resume') state.paused_at = null;
     if (action === 'stop') state.stopping_at = new Date().toISOString();
     writeSessionState(paths, state);
-    process.kill(Number(state.worker_pid), signal);
+    for (const signal of signals) {
+        process.kill(Number(state.worker_pid), signal);
+    }
     return {
         measurement_session_id: state.measurement_session_id,
         status: state.status,
@@ -795,6 +802,7 @@ module.exports = {
     MeasurementSessionRequestError,
     buildPreflight,
     classifyClockState,
+    controlSignals,
     inspectClock,
     interruptedModuleResult,
     requiredRfBands,
