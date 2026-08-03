@@ -7,12 +7,17 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const {
+    buildTimeSeriesContext,
+    readActiveDeployment
+} = require('./time-series-context');
 
 const DEFAULT_ENV_FILE = '/etc/nms-collector/collector.env';
 const DEFAULT_STATE_DIR = '/var/lib/nms-collector/wifi-analysis';
 const DEFAULT_MEASUREMENT_SESSION_STATE_FILE = '/var/lib/nms-collector/measurement-sessions/active.json';
 const SCHEMA_VERSION = 'metro-wifi-analysis-v1';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+let preferredNmsBaseUrl = '';
 
 class NmsRequestError extends Error {
     constructor(statusCode, responseBody) {
@@ -52,6 +57,38 @@ function resolveNmsBaseUrl(env) {
     const port = parsePositiveInteger(env.NMS_PORT, 7443, 1, 65535);
     const rawPath = String(env.NMS_PATH || '').trim().replace(/^\/+|\/+$/g, '');
     return host ? `${scheme}://${host}:${port}${rawPath ? `/${rawPath}` : ''}` : '';
+}
+
+function resolveNmsBaseUrls(env) {
+    const urls = [
+        resolveNmsBaseUrl(env),
+        String(env.NMS_FALLBACK_URL || '').trim().replace(/\/+$/, '')
+    ].filter(Boolean);
+    const unique = [...new Set(urls)];
+    if (preferredNmsBaseUrl && unique.includes(preferredNmsBaseUrl)) {
+        return [preferredNmsBaseUrl, ...unique.filter((url) => url !== preferredNmsBaseUrl)];
+    }
+    return unique;
+}
+
+function isRetryableNmsError(error) {
+    return !(error instanceof NmsRequestError && error.statusCode < 500);
+}
+
+async function requestWithNmsFallback(env, operation) {
+    const urls = resolveNmsBaseUrls(env);
+    let lastError = null;
+    for (const baseUrl of urls) {
+        try {
+            const result = await operation(baseUrl);
+            preferredNmsBaseUrl = baseUrl;
+            return result;
+        } catch (error) {
+            lastError = error;
+            if (!isRetryableNmsError(error)) throw error;
+        }
+    }
+    throw lastError || new Error('no NMS endpoint is configured');
 }
 
 function parseEnvFile(filePath = DEFAULT_ENV_FILE, baseEnv = process.env) {
@@ -235,13 +272,37 @@ class IncidentWindowManager {
 }
 
 function classifyIncident(records, triggerType) {
+    const latestBy = (samples, keySelector) => {
+        const latest = new Map();
+        for (const sample of samples) {
+            const key = keySelector(sample);
+            const previous = latest.get(key);
+            if (!previous || Date.parse(sample.observed_at || '') >= Date.parse(previous.observed_at || '')) {
+                latest.set(key, sample);
+            }
+        }
+        return latest;
+    };
     const external = records.filter((record) => record.kind === 'connectivity'
         && ['kt_dns', 'google_dns'].includes(record.target_kind));
-    const recent = new Map();
-    for (const sample of external) recent.set(sample.interface_role, sample);
+    const recent = latestBy(external, (sample) => sample.interface_role);
+    const gateways = latestBy(
+        records.filter((record) => record.kind === 'connectivity' && record.target_kind === 'gateway'),
+        (sample) => sample.interface_role
+    );
+    const latestWifi = [...records]
+        .filter((record) => record.kind === 'wifi')
+        .sort((left, right) => Date.parse(right.observed_at || '') - Date.parse(left.observed_at || ''))[0];
     const wired = recent.get('wired');
-    const wireless = recent.get('wireless');
+    const wireless = latestWifi?.connected === false ? null : recent.get('wireless');
+    const wiredGateway = gateways.get('wired');
+    if (wired && !wired.success && wiredGateway && !wiredGateway.success) {
+        return { classification: 'gateway_or_wired_path', confidence: 'high' };
+    }
     if (wired && wireless && !wired.success && !wireless.success) {
+        return { classification: 'upstream_or_common_path', confidence: 'medium' };
+    }
+    if (wired && !wired.success && wiredGateway?.success) {
         return { classification: 'upstream_or_common_path', confidence: 'medium' };
     }
     if (wired?.success && wireless && !wireless.success) {
@@ -250,6 +311,7 @@ function classifyIncident(records, triggerType) {
     if (triggerType === 'bssid_change') return { classification: 'roaming_or_authentication', confidence: 'low' };
     if (triggerType === 'rssi_drop') return { classification: 'coverage_or_wireless_change', confidence: 'low' };
     if (triggerType === 'rf_energy_spike') return { classification: 'rf_interference_possible', confidence: 'low' };
+    if (triggerType === 'gateway_latency_degraded') return { classification: 'gateway_or_wired_path', confidence: 'high' };
     return { classification: 'unknown', confidence: 'low' };
 }
 
@@ -393,9 +455,16 @@ function requestJson(urlValue, payload, env) {
             'Content-Length': body.length,
             'X-Collector-Token': String(env.COLLECTOR_TOKEN || '')
         },
-        timeout: 15000
+        timeout: parsePositiveInteger(env.NMS_REQUEST_TIMEOUT_MS, 5000, 1000, 30000)
     };
-    if (target.protocol === 'https:' && parseBoolean(env.NMS_INSECURE_TLS, false)) options.rejectUnauthorized = false;
+    if (target.protocol === 'https:') {
+        if (parseBoolean(env.NMS_INSECURE_TLS, false)) {
+            options.rejectUnauthorized = false;
+        } else {
+            const caPath = String(env.NMS_CA_CERT_PATH || '').trim();
+            if (caPath) options.ca = fs.readFileSync(caPath);
+        }
+    }
     return new Promise((resolve, reject) => {
         const request = transport.request(options, (response) => {
             let responseBody = '';
@@ -425,12 +494,23 @@ function buildBatch(records, event = null, measurementSessionId = null) {
         throw new Error('Wi-Fi analysis batch cannot mix measurement sessions');
     }
     const resolvedSessionId = measurementSessionId || observedSessionIds[0] || null;
+    const generatedAt = new Date();
+    const deployment = readActiveDeployment(
+        process.env.DEPLOYMENT_MONITORING_STATE_FILE
+        || '/var/lib/nms-collector/deployment-monitoring/active.json'
+    );
+    const timeseries = buildTimeSeriesContext(
+        generatedAt,
+        deployment,
+        process.env.DEPLOYMENT_MONITORING_INTERVAL_SECONDS
+    );
     const withoutContext = ({ kind, measurement_session_id: _sessionId, ...record }) => record;
     return {
         schema_version: SCHEMA_VERSION,
         batch_id: crypto.randomUUID(),
         measurement_session_id: resolvedSessionId,
-        generated_at: new Date().toISOString(),
+        generated_at: generatedAt.toISOString(),
+        timeseries,
         hostname: os.hostname(),
         event,
         connectivity_samples: records.filter((record) => record.kind === 'connectivity').map(withoutContext),
@@ -605,11 +685,14 @@ async function collectRfSweep(env, profile = null) {
 }
 
 function createTriggerState() {
-    return { failures: new Map(), previousWifi: null, previousRfAverage: null };
+    return { failures: new Map(), highLatency: new Map(), previousWifi: null, previousRfAverage: null };
 }
 
 function detectTriggers(records, state, incidents, env) {
+    state.highLatency ||= new Map();
     const latencyThreshold = parsePositiveInteger(env.WIFI_ANALYSIS_LATENCY_THRESHOLD_MS, 200, 10, 60000);
+    const gatewayLatencyThreshold = parsePositiveInteger(env.WIFI_ANALYSIS_GATEWAY_LATENCY_THRESHOLD_MS, 20, 5, 60000);
+    const gatewayLatencyBurstCount = parsePositiveInteger(env.WIFI_ANALYSIS_GATEWAY_LATENCY_BURST_COUNT, 3, 2, 20);
     const failureThreshold = parsePositiveInteger(env.WIFI_ANALYSIS_FAILURE_BURST_COUNT, 3, 2, 20);
     const rssiDropThreshold = parsePositiveInteger(env.WIFI_ANALYSIS_RSSI_DROP_DB, 10, 3, 50);
     const rfSpikeThreshold = parsePositiveInteger(env.WIFI_ANALYSIS_RF_SPIKE_DB, 10, 3, 50);
@@ -618,7 +701,20 @@ function detectTriggers(records, state, incidents, env) {
             const key = `${record.interface_role}:${record.target_kind}`;
             const failures = record.success ? 0 : (state.failures.get(key) || 0) + 1;
             state.failures.set(key, failures);
-            if (record.route_verified && record.latency_ms >= latencyThreshold) {
+            const isWiredGateway = record.interface_role === 'wired' && record.target_kind === 'gateway';
+            const threshold = isWiredGateway ? gatewayLatencyThreshold : latencyThreshold;
+            const highLatencyCount = record.route_verified && Number.isFinite(record.latency_ms)
+                && record.latency_ms >= threshold
+                ? (state.highLatency.get(key) || 0) + 1
+                : 0;
+            state.highLatency.set(key, highLatencyCount);
+            if (isWiredGateway && highLatencyCount === gatewayLatencyBurstCount) {
+                incidents.trigger('gateway_latency_degraded', {
+                    ...record,
+                    threshold_ms: gatewayLatencyThreshold,
+                    consecutive_samples: highLatencyCount
+                }, record.observed_at);
+            } else if (!isWiredGateway && record.route_verified && record.latency_ms >= threshold) {
                 incidents.trigger('latency_threshold', record, record.observed_at);
             }
             if (record.route_verified && failures === failureThreshold) {
@@ -626,6 +722,11 @@ function detectTriggers(records, state, incidents, env) {
             }
         } else if (record.kind === 'wifi') {
             const previous = state.previousWifi;
+            if (!record.connected) {
+                for (const key of state.failures.keys()) {
+                    if (key.startsWith('wireless:')) state.failures.delete(key);
+                }
+            }
             if (previous?.connected && record.connected && previous.bssid && record.bssid && previous.bssid !== record.bssid) {
                 incidents.trigger('bssid_change', { previous_bssid: previous.bssid, current_bssid: record.bssid }, record.observed_at);
             }
@@ -648,8 +749,8 @@ function detectTriggers(records, state, incidents, env) {
 
 async function flushQueue(stateDir, env, dependencies = {}) {
     const collectorId = parsePositiveInteger(env.COLLECTOR_ID, 0);
-    const baseUrl = resolveNmsBaseUrl(env);
-    if (!collectorId || !baseUrl || !String(env.COLLECTOR_TOKEN || '').trim()) {
+    const baseUrls = resolveNmsBaseUrls(env);
+    if (!collectorId || !baseUrls.length || !String(env.COLLECTOR_TOKEN || '').trim()) {
         return { sent: 0, pending: listQueuedBatches(stateDir).length };
     }
     let sent = 0;
@@ -658,7 +759,11 @@ async function flushQueue(stateDir, env, dependencies = {}) {
     for (const filePath of listQueuedBatches(stateDir)) {
         const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
         try {
-            await request(`${baseUrl}/api/collectors/${collectorId}/wifi-analysis/batches`, payload, env);
+            await requestWithNmsFallback(env, (baseUrl) => request(
+                `${baseUrl}/api/collectors/${collectorId}/wifi-analysis/batches`,
+                payload,
+                env
+            ));
             fs.unlinkSync(filePath);
             sent += 1;
         } catch (error) {
@@ -706,6 +811,7 @@ async function runAgent(env) {
     let lastUploadAt = 0;
     let activeMeasurementSessionId = null;
     let rfProfileIndex = 0;
+    let latestWifiSample = null;
 
     while (true) {
         const loopStartedAt = Date.now();
@@ -724,19 +830,25 @@ async function runAgent(env) {
             ['kt_dns', String(env.DIAGNOSTIC_KT_PING_TARGET || '168.126.63.1').trim()],
             ['google_dns', String(env.DIAGNOSTIC_GOOGLE_PING_TARGET || '8.8.8.8').trim()]
         ];
+        const records = [];
+        const nowMs = Date.now();
+        if (nowMs - lastWifiAt >= parsePositiveInteger(env.WIFI_ANALYSIS_WIFI_INTERVAL_SECONDS, 5, 2, 60) * 1000) {
+            latestWifiSample = await collectWifiSample(interfaces.wireless);
+            records.push(latestWifiSample);
+            lastWifiAt = nowMs;
+        }
         const pingPromises = [];
-        for (const [role, interfaceName] of [['wired', interfaces.wired], ['wireless', interfaces.wireless]]) {
+        const activeInterfaces = [['wired', interfaces.wired]];
+        if (latestWifiSample?.connected) {
+            activeInterfaces.push(['wireless', interfaces.wireless]);
+        }
+        for (const [role, interfaceName] of activeInterfaces) {
             const targets = [['gateway', gateways[role]], ...commonTargets];
             for (const [targetKind, target] of targets) {
                 if (target) pingPromises.push(collectConnectivitySample(role, interfaceName, targetKind, target));
             }
         }
-        const records = await Promise.all(pingPromises);
-        const nowMs = Date.now();
-        if (nowMs - lastWifiAt >= parsePositiveInteger(env.WIFI_ANALYSIS_WIFI_INTERVAL_SECONDS, 5, 2, 60) * 1000) {
-            records.push(await collectWifiSample(interfaces.wireless));
-            lastWifiAt = nowMs;
-        }
+        records.push(...await Promise.all(pingPromises));
         if (parseBoolean(env.TINYSA_ENABLED, false)
             && nowMs - lastRfAt >= parsePositiveInteger(env.TINYSA_INTERVAL_SECONDS, 3, 1, 300) * 1000) {
             const sessionProfiles = activeSession?.module_run_ids?.rf
@@ -877,5 +989,7 @@ module.exports = {
     readActiveMeasurementSession,
     updateMeasurementSessionStats,
     resolveNmsBaseUrl,
+    resolveNmsBaseUrls,
+    requestWithNmsFallback,
     splitRecordsIntoBatches
 };

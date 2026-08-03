@@ -5,7 +5,8 @@ const os = require('os');
 const path = require('path');
 const {
     loadCollectorEnv,
-    resolveNmsUrl
+    resolveNmsUrl,
+    resolveNmsUrls
 } = require('../nms-collector');
 const queue = require('./lib/queue');
 const { isEnabled, requestJson } = require('./lib/transport');
@@ -13,6 +14,10 @@ const pingPlugin = require('./plugins/ping');
 const tcpPlugin = require('./plugins/tcp');
 const httpPlugin = require('./plugins/http');
 const systemPlugin = require('./plugins/system');
+const {
+    buildTimeSeriesContext,
+    readActiveDeployment
+} = require('../time-series-context');
 
 const AGENT_VERSION = '0.1.0';
 const DEFAULT_ENV_FILE = '/etc/nms-collector/collector.env';
@@ -22,6 +27,7 @@ const PLUGINS = {
     http: httpPlugin,
     system: systemPlugin
 };
+let preferredNmsBaseUrl = '';
 
 function runtimePaths(env) {
     const root = String(env.METRO_AGENT_V1_STATE_DIR || '/var/lib/nms-collector/metro-agent-v1').trim();
@@ -49,6 +55,24 @@ function batchUrl(env, collectorId) {
     return `${resolveNmsUrl(env).replace(/\/+$/, '')}/api/collectors/${collectorId}/metro-agent/check-batches`;
 }
 
+async function requestWithFallback(env, pathSuffix, options, request) {
+    const configuredUrls = resolveNmsUrls(env);
+    const urls = preferredNmsBaseUrl && configuredUrls.includes(preferredNmsBaseUrl)
+        ? [preferredNmsBaseUrl, ...configuredUrls.filter((url) => url !== preferredNmsBaseUrl)]
+        : configuredUrls;
+    let lastError = null;
+    for (const baseUrl of urls) {
+        try {
+            const result = await request(`${baseUrl.replace(/\/+$/, '')}${pathSuffix}`, options);
+            preferredNmsBaseUrl = baseUrl;
+            return result;
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError || new Error('metro agent has no NMS endpoint');
+}
+
 function validateConfig(config, expectedCollectorId) {
     if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('metro agent config is invalid');
     if (config.schema_version !== 'metro-agent-config-v1') throw new Error('metro agent config schema is unsupported');
@@ -65,21 +89,25 @@ function validateConfig(config, expectedCollectorId) {
 
 async function fetchConfig(env, credentials, dependencies = {}) {
     const request = dependencies.requestJson || requestJson;
-    return validateConfig(await request(configUrl(env, credentials.collectorId), {
+    return validateConfig(await requestWithFallback(
+        env,
+        `/api/collectors/${credentials.collectorId}/metro-agent/config`,
+        {
         method: 'GET',
         token: credentials.token,
         timeoutMs: Number(env.METRO_AGENT_V1_HTTP_TIMEOUT_MS) || 15000,
         env
-    }), credentials.collectorId);
+        },
+        request
+    ), credentials.collectorId);
 }
 
 async function executePlan(config, dependencies = {}) {
     const plugins = dependencies.plugins || PLUGINS;
-    const results = [];
-    for (const check of config.checks) {
+    const groups = await Promise.all(config.checks.map(async (check) => {
         const plugin = plugins[check.type];
         if (!plugin || typeof plugin.run !== 'function') {
-            results.push({
+            return [{
                 result_id: `${check.key}:plugin`,
                 check_key: check.key,
                 check_type: check.type,
@@ -92,14 +120,12 @@ async function executePlan(config, dependencies = {}) {
                 source: 'metro_agent_plugin_loader',
                 error_code: 'plugin_unavailable',
                 details: {}
-            });
-            continue;
+            }];
         }
         try {
-            const pluginResults = await plugin.run(check, dependencies.pluginContext || {});
-            results.push(...pluginResults);
+            return await plugin.run(check, dependencies.pluginContext || {});
         } catch (error) {
-            results.push({
+            return [{
                 result_id: `${check.key}:execution`,
                 check_key: check.key,
                 check_type: check.type,
@@ -112,13 +138,18 @@ async function executePlan(config, dependencies = {}) {
                 source: 'metro_agent_plugin_runner',
                 error_code: String(error.code || 'plugin_failed').slice(0, 100),
                 details: { message: String(error.message || 'plugin failed').slice(0, 500) }
-            });
+            }];
         }
-    }
-    return results;
+    }));
+    return groups.flat();
 }
 
 function buildBatch(config, results, env, now = new Date()) {
+    const deployment = readActiveDeployment(
+        env.DEPLOYMENT_MONITORING_STATE_FILE
+        || '/var/lib/nms-collector/deployment-monitoring/active.json'
+    );
+    const timeseries = buildTimeSeriesContext(now, deployment, config.interval_seconds);
     return {
         batch_id: crypto.randomUUID(),
         schema_version: 'metro-agent-check-batch-v1',
@@ -129,7 +160,8 @@ function buildBatch(config, results, env, now = new Date()) {
         metadata: {
             platform: process.platform,
             architecture: process.arch,
-            result_semantics: 'missing-is-not-zero'
+            result_semantics: 'missing-is-not-zero',
+            timeseries
         },
         results
     };
@@ -142,13 +174,18 @@ async function flushQueue(env, credentials, dependencies = {}) {
     let delivered = 0;
     for (const filePath of files) {
         const batch = queue.readBatch(filePath);
-        await request(batchUrl(env, credentials.collectorId), {
+        await requestWithFallback(
+            env,
+            `/api/collectors/${credentials.collectorId}/metro-agent/check-batches`,
+            {
             method: 'POST',
             token: credentials.token,
             payload: batch,
             timeoutMs: Number(env.METRO_AGENT_V1_HTTP_TIMEOUT_MS) || 15000,
             env
-        });
+            },
+            request
+        );
         queue.removeBatch(filePath);
         delivered += 1;
     }

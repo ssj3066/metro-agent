@@ -120,7 +120,9 @@ curl -X POST "${NMS_BASE_URL}/api/collectors" \
 
 `nms-collector.js`는 `heartbeat`, `trap-forwarder`, `diagnostic-worker`, `diagnostic-once`, `edge-analysis`, `edge-analysis-heartbeat`, `doctor`, `render-rsyslog-config` 서브커맨드를 한 런타임에서 제공합니다. 설치 스크립트도 이 런타임을 사용해 env를 검증하고 rsyslog relay 설정을 생성합니다.
 
-systemd 타이머는 기본 60초 주기로 heartbeat를 전송합니다. Desktop GUI를 열지 않아도 부팅 후 `network-online.target`에서 `nms-collector-autostart.service`가 heartbeat, 원격진단, edge 분석을 준비합니다. NetworkManager가 DHCP 주소를 새로 받거나 링크가 복구되면 dispatcher가 즉시 heartbeat와 edge 분석을 한 번 실행합니다. WireGuard는 원격 접속용 선택 기능이며, VPN 상태와 무관하게 중앙 NMS HTTPS 전송은 계속 시도합니다.
+systemd 타이머는 기본 60초 주기로 heartbeat를 전송합니다. Desktop GUI를 열지 않아도 부팅 후 `network-online.target`에서 `nms-collector-autostart.service`가 heartbeat, 원격진단, edge 분석을 준비합니다. NetworkManager가 DHCP 주소를 새로 받거나 링크가 복구되면 dispatcher가 즉시 heartbeat와 edge 분석을 한 번 실행합니다. `REMOTE_MANAGEMENT_MODE=omada_vpn`인데 WireGuard 서비스가 비활성 상태이면 dispatcher가 물리 네트워크 복구 시 VPN도 다시 시작합니다. WireGuard는 원격 접속용 선택 기능이며, VPN 상태와 무관하게 중앙 NMS HTTPS 전송은 계속 시도합니다.
+
+Wi-Fi/RF 실시간 전송도 `NMS_URL`과 `NMS_FALLBACK_URL`을 순서대로 사용합니다. 공인 경로가 타임아웃되고 VPN 내부 경로가 성공하면 실행 중인 서비스는 성공한 경로를 우선 캐시하므로 이후 배치가 매번 공인 타임아웃을 기다리지 않습니다. 이동 후 Pulse 주소가 현재 기본 유선 서브넷 밖에 있으면 이전 현장 설정으로 보고 로컬 Pulse 폴링을 건너뜁니다. 의도적으로 라우팅된 Pulse VLAN만 `PULSE_LOCAL_REQUIRE_PRIMARY_SUBNET=false`로 예외 처리합니다.
 
 ## Metro Agent V1
 
@@ -159,6 +161,15 @@ sudo ENV_FILE=/etc/nms-collector/collector.env \
 
 현장 이동 후 현재 연결 정보는 heartbeat metadata의 `current_network`에 인터페이스, 내부 IP/CIDR, 서브넷, 기본 게이트웨이, 수집 시각으로 기록됩니다. 중앙 NMS가 본 공인 IP는 ingress 관측값으로 별도 기록합니다. `REMOTE_MANAGEMENT_MODE=omada_vpn`이면 VPN 인터페이스, 서비스 상태, handshake 신선도도 `vpn` metadata에 기록합니다. VPN 경고와 HTTPS 수집 상태는 분리하며, 공인 IP와 고객사 사설 IP는 collector.env에 고정하지 않습니다.
 
+공인 IPv4는 heartbeat마다 외부 확인 서비스에서 수집하고 `public_ip`와
+`metadata.public_ip_observation`에 값, 원천, 측정시각, 상태를 기록합니다.
+기본값은 `PUBLIC_IP_COLLECTION_ENABLED=true`,
+`PUBLIC_IP_ENDPOINTS=https://api.ipify.org,https://ifconfig.me/ip`,
+`PUBLIC_IP_TIMEOUT_MS=3000`입니다. 사설/VPN/CGNAT 주소는 공인 IP로 저장하지
+않으며, 외부 조회가 차단되면 값을 만들지 않고 `unavailable`로 남깁니다.
+
+현장 반출 표준 순서는 `유선 DHCP 확인 -> 공인 HTTPS와 VPN 대체 경로 확인 -> 119 현장 직접 선택 -> 기존 화면 초기화 확인 -> 짧은 동시 측정 -> 안전 중지 및 표본 저장 확인 -> 필요 시 패킷 캡처`입니다. 현장을 선택하지 않은 상태에서는 측정을 시작하지 않으며, 선택 직후 화면은 `테스트 안 됨`으로 초기화됩니다. 일반 액세스 포트 캡처는 수집기 자신에게 보이는 트래픽만 포함하므로 현장 전체 플러딩 판정에는 스위치 SPAN/미러 포트를 사용합니다.
+
 syslog relay를 켜면 `RSYSLOG_TARGET_HOST`, `RSYSLOG_TARGET_PORT`, `RSYSLOG_TARGET_PROTOCOL` 기준으로 `/etc/rsyslog.d/49-nms-relay.conf`를 생성합니다. `COLLECTOR_ROLE`은 `ubuntu_agent`, `syslog_gateway`, `snmp_proxy`, `hybrid` 중 하나를 쓸 수 있고, `doctor`가 역할과 실제 기능 플래그(`ENABLE_RSYSLOG_RELAY`, `ENABLE_SNMPTRAP_RELAY`)가 어긋나면 경고를 출력합니다.
 
 원격 진단을 켜면 `nms-collector-diagnostic-worker.service`가 중앙 NMS의 `/api/collectors/:collectorId/diagnostic-commands/pending`을 poll 방식으로 확인하고, 명령 실행 후 `/api/collectors/:collectorId/diagnostic-commands/:commandId/result`로 결과를 올립니다. 지원 명령은 `ping`, `traceroute`, `dns`, `tcp`, `http`, `tcpdump`, `arpwatch`, `bandwidth`, `measurement`, `gateway-info`, `tools-info`, `goal`입니다. 기본 보안값은 내부망/RFC1918 IP와 gateway 키워드 중심이며, 공인 IP 대상 진단은 `DIAGNOSTIC_ALLOW_PUBLIC_TARGETS=true`로 명시해야 합니다.
@@ -176,6 +187,8 @@ GUI는 Metro 색상 체계와 좌측 탐색을 사용하는 현장 작업 화면
 `실시간 모니터링` 화면은 선택 인터페이스의 커널 누적 counter를 2초 간격으로 차분해 수신·송신 Mbps와 PPS를 표시합니다. 누적 오류·드롭, 게이트웨이 ICMP 지연, 활성 연결 수, 현재 주소와 링크 상태도 함께 표시합니다. `lldpd`는 receive-only `-r -c`로 실행해 LLDP와 Cisco CDP를 모두 수신하며, 이웃 표에는 원천 프로토콜, 로컬 포트, 장비명, 관리 IP, 상대 포트와 관측 경과를 구분해 표시합니다. 일반 access 포트에서는 직접 연결된 이웃 광고만 볼 수 있으며, 스위치에서 LLDP/CDP가 비활성화된 경우 0건은 정상 판정이 아니라 미관측입니다.
 
 `패킷 캡처` 화면의 실시간 모드는 TShark 헤더 요약을 연속 표시하면서 `/var/log/nms-pcap/live-*.pcapng`에 원본을 저장합니다. 임의 BPF 입력 대신 전체 헤더, 플러딩 분석, 기본 통신, DNS, DHCP, ARP, Ping, LLDP/CDP 프로필만 제공하며 최대 30분, 50MB, 패킷당 256바이트에서 자동 종료됩니다. 화면에는 최근 500개 헤더만 유지합니다. 중지 버튼은 캡처 프로세스 그룹에 종료 신호를 보내고, 완료된 파일은 `adm` 그룹 읽기와 `0640` 권한으로 보관합니다.
+
+`선택 요약/전송`은 선택한 PCAP을 다시 분석해 측정시각, 통계, 원본 파일 해시와 관측 범위만 중앙 NMS에 저장합니다. 원본 PCAP과 패킷 payload는 130번에만 남기며 중앙으로 전송하지 않습니다.
 
 플러딩 분석은 Broadcast, Multicast, ARP, mDNS, SSDP, LLMNR, NBNS, DHCP를 개수, 비율, pps로 집계합니다. 프로토콜 디코딩이 UDP로만 표시되는 경우에도 표준 UDP 포트로 다시 분류합니다. 관측시간 5초 또는 패킷 20개 미만이면 임계값 판정을 하지 않고 `판단 자료 부족`으로 표시합니다. pps 임계값 초과는 `플러딩 후보`이며 확정 장애가 아닙니다. 전체 현장 판단에는 스위치 SPAN/미러 포트 또는 트렁크 관측이 필요합니다.
 
@@ -205,7 +218,7 @@ edge 분석을 켜면 `nms-collector-edge-analysis.timer`가 10분마다 서버 
 TLS 메모:
 
 - 기본 예시는 `https://...:7443` 기준입니다.
-- 중앙 NMS가 self-signed 인증서를 쓴다면 `NMS_INSECURE_TLS=true` 또는 `NMS_CA_CERT_PATH=/path/to/ca.crt` 중 하나를 맞춥니다.
+- 중앙 NMS가 self-signed 인증서를 쓴다면 인증서를 `/etc/nms-collector/nms-ca.crt`에 설치하고 `NMS_CA_CERT_PATH`로 고정하는 방식을 사용합니다. `NMS_INSECURE_TLS=true`는 인증서 교체 중 임시 진단에만 사용합니다.
 - `doctor` 출력에는 현재 TLS 모드(`system-ca`, `custom-ca`, `insecure`)도 함께 표시됩니다.
 
 Uptime Kuma 메모:
@@ -271,7 +284,7 @@ SNMP trap relay를 켜면 `nms-collector-trap-forwarder.service`가 `SNMPTRAP_LI
 4. `SNMPTRAP_DISABLE_AUTHORIZATION=false`를 기본값으로 두고, `SNMPTRAP_COMMUNITIES`를 실제 community 값으로 맞추는 편이 안전합니다.
 5. example env 그대로 두면 installer가 서비스를 올리지 않습니다. 먼저 실제 `COLLECTOR_ID`, `COLLECTOR_TOKEN`, `NMS_HOST/NMS_URL`을 넣고 `doctor`를 통과시켜야 합니다.
 6. `syslog_gateway`나 `hybrid` 역할이면 `ENABLE_RSYSLOG_RELAY=true`와 `RSYSLOG_TARGET_*`를 같이 맞추는 편이 안전합니다.
-7. self-signed TLS를 쓰는 현장은 `NMS_INSECURE_TLS=true`가 가장 빠른 전환 방법이고, 장기적으로는 사내 CA 또는 공인 인증서로 바꾸는 편이 낫습니다.
+7. self-signed TLS를 쓰는 현장도 `NMS_CA_CERT_PATH=/etc/nms-collector/nms-ca.crt`로 인증서를 검증합니다. `NMS_INSECURE_TLS=true`를 운영 기본값으로 두지 않습니다.
 8. 원격 진단은 기본 활성화(`REMOTE_DIAGNOSTICS_ENABLED=true`)입니다. 현장 서버를 단순 heartbeat 전용으로 쓸 때만 false로 끕니다.
 9. `tcpdump` 원격진단은 기본 15초/500패킷, 최대 60초/2,000패킷으로 제한합니다. 원본 PCAPNG는 130번 `/var/log/nms-pcap`에 기본 24시간만 보관하고 중앙에는 패킷 payload 없이 프로토콜·통신쌍·DNS/ARP/ICMP/TCP 이상·VLAN/LLDP 통계와 원본 SHA-256만 올립니다. `capture_scope=collector_interface`가 기본이며 SPAN/미러 또는 트렁크가 확인되지 않으면 전체 현장 트래픽으로 해석하지 않습니다. `any` 인터페이스처럼 Ethernet 목적지 주소가 노출되지 않는 캡처의 Broadcast/Multicast는 `0`이 아니라 `측정 불가`로 처리합니다. TCP 재전송은 부분 캡처 안에서 TShark가 판정한 의심 건수이며 회선 전체의 확정 재전송 수가 아닙니다. 비어 있는 프로토콜 필드는 `0`과 구분해 집계 대상에서 제외합니다.
 10. Edge heartbeat의 `neighbor_entries`는 `ip neigh`를 IP, MAC, 인터페이스, 상태, 주소 구분, 라우터 플래그로 구조화한 현재 스냅샷입니다. 커널 neighbor cache이므로 현장 전체 자산 목록으로 해석하지 않습니다. LLDP 상세는 `lldpcli`와 스위치 SNMP LLDP-MIB 원천을 구분하며, 0건은 정상 장비 0대가 아니라 미광고·비지원·관측 범위 부족 가능성을 포함합니다.
@@ -295,6 +308,8 @@ sudo ENV_FILE=/etc/nms-collector/collector.env \
 - `site-standard-check`: gateway 정보, gateway ping, DNS, NMS TCP 연결 확인
 - `router-standard-check`: site 표준점검 + 외부 Ping/HTTPS + ARP neighbor 요약
 - `firewall-standard-check`: site 표준점검 + 외부 Ping/HTTPS + ARP neighbor 요약
+- 게이트웨이 Ping이 성공하더라도 평균 지연이 20ms 이상이면 `local_gateway_degraded`로 판정한다. LAN 게이트웨이 지연을 인터넷 정상으로 숨기지 않으며, 게이트웨이 장비 부하와 연결 포트/경로를 추가로 분리 점검한다.
+- 상시 분석은 유선 게이트웨이 지연이 기본 20ms 이상으로 3회 연속 관측되면 `gateway_latency_degraded` 사건을 생성한다. `WIFI_ANALYSIS_GATEWAY_LATENCY_THRESHOLD_MS`와 `WIFI_ANALYSIS_GATEWAY_LATENCY_BURST_COUNT`로 현장 기준선을 조정할 수 있다.
 
 모든 표준점검은 gateway Ping, 외부 Ping, DNS, 인터넷 HTTPS, 중앙 NMS TCP를 분리합니다. 외부 Ping은 정상이지만 HTTPS가 실패하면 `firewall_policy_session` 후보로 기록합니다. 이는 인증받지 않은 단말에 ICMP만 허용하고 인터넷 세션을 차단하는 현장 정책을 찾기 위한 규칙입니다.
 

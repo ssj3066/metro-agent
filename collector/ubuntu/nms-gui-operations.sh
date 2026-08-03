@@ -5,12 +5,29 @@ OUTPUT_DIR="/var/log/nms-pcap"
 WIRELESS_SCAN="/opt/nms-collector/nms-wireless-scan.py"
 PACKET_FLOOD_ANALYZER="/usr/local/bin/nms_packet_flood.py"
 COLLECTOR_ENV="/etc/nms-collector/collector.env"
+COLLECTOR="/opt/nms-collector/nms-collector.js"
+NODE="/usr/local/bin/node"
+SNMP_TARGETS="/opt/nms-collector/configure-snmp-targets.sh"
 action="${1:-}"
 declare -A nm_wireguard_profiles=()
 
 require_interface() {
   [[ "$1" =~ ^[a-zA-Z0-9_.:-]+$ ]] || { echo "invalid interface" >&2; exit 2; }
   ip link show "$1" >/dev/null 2>&1 || { echo "interface not found: $1" >&2; exit 2; }
+}
+
+arp_scan_interfaces() {
+  local interface address prefix
+  while read -r interface address; do
+    [[ "$interface" == "lo" ]] && continue
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]] || continue
+    prefix="${BASH_REMATCH[2]}"
+    (( prefix < 32 )) || continue
+    case "$interface" in
+      *wg*|*tun*|*tap*|lo) continue ;;
+    esac
+    printf '%s\t%s\n' "$interface" "$address"
+  done < <(ip -o -4 addr show up scope global | awk '{print $2, $4}' | sort -u)
 }
 
 require_live_capture_pid() {
@@ -100,6 +117,38 @@ show_interface_status() {
 }
 
 case "$action" in
+  edge-analysis)
+    exec "$NODE" "$COLLECTOR" edge-analysis
+    ;;
+  snapshot-session)
+    send_flag="${2:-}"
+    [[ -z "$send_flag" || "$send_flag" == "--send" ]] || { echo "invalid snapshot option" >&2; exit 2; }
+    args=(snapshot-session --field-profile-stdin)
+    [[ "$send_flag" == "--send" ]] && args+=(--send)
+    exec "$NODE" "$COLLECTOR" "${args[@]}"
+    ;;
+  snmp)
+    shift
+    case "${1:-}" in
+      show-json|defaults|community|add|remove|enable|disable) ;;
+      *) echo "unsupported SNMP operation" >&2; exit 2 ;;
+    esac
+    exec "$SNMP_TARGETS" "$@"
+    ;;
+  service-restart)
+    unit="${2:-}"
+    case "$unit" in
+      nms-collector-heartbeat.timer|wg-quick@metro-omada.service|nms-collector-diagnostic-worker.service|nms-collector-edge-analysis.timer|nms-collector-trap-forwarder.service|nms-iperf3-server.service|rsyslog.service|lldpd.service) ;;
+      *) echo "unsupported service" >&2; exit 2 ;;
+    esac
+    exec systemctl restart "$unit"
+    ;;
+  offline-list)
+    exec "$NODE" "$COLLECTOR" offline-measurements list
+    ;;
+  offline-flush)
+    exec "$NODE" "$COLLECTOR" offline-measurements flush
+    ;;
   tinysa-status)
     [[ -f "$COLLECTOR_ENV" ]] || { echo "collector env not found" >&2; exit 2; }
     enabled="$(awk -F= '$1 == "TINYSA_ENABLED" {value=$2} END {print value}' "$COLLECTOR_ENV")"
@@ -109,6 +158,17 @@ case "$action" in
   arp-scan)
     interface="${2:-}"; require_interface "$interface"
     exec arp-scan --interface="$interface" --localnet
+    ;;
+  arp-scan-all)
+    mapfile -t arp_targets < <(arp_scan_interfaces)
+    [[ "${#arp_targets[@]}" -gt 0 ]] || { echo "no suitable broadcast-capable IPv4 interfaces found" >&2; exit 2; }
+    for target in "${arp_targets[@]}"; do
+      interface="${target%%$'\t'*}"
+      address="${target#*$'\t'}"
+      require_interface "$interface"
+      printf '\n=== %s (%s) ===\n' "$interface" "$address"
+      arp-scan --interface="$interface" --localnet || true
+    done
     ;;
   capture)
     interface="${2:-}"; profile="${3:-basic}"; duration="${4:-15}"
@@ -214,6 +274,15 @@ case "$action" in
     tshark -r "$file" -q -z io,phs 2>/dev/null | head -60
     echo; echo "[상위 통신 흐름]"
     tshark -r "$file" -T fields -e ip.src -e ip.dst -e _ws.col.Protocol 2>/dev/null | awk 'NF' | sort | uniq -c | sort -nr | head -30
+    ;;
+  summarize-upload)
+    file="${2:-}"
+    case "$file" in
+      "$OUTPUT_DIR"/gui-*.pcap|"$OUTPUT_DIR"/live-*.pcapng) ;;
+      *) echo "invalid capture file" >&2; exit 2 ;;
+    esac
+    [[ -f "$file" ]] || { echo "capture file not found" >&2; exit 2; }
+    exec "$NODE" "$COLLECTOR" upload-pcap "$file"
     ;;
   interface-status)
     show_interface_status
@@ -380,7 +449,7 @@ case "$action" in
     esac
     ;;
   *)
-    echo "usage: $0 {arp-scan|capture|live-capture|list-captures|summarize|interface-status|wireless-scan|tinysa-config|collector-name|vpn-list|vpn-import|vpn-up|vpn-down|vpn-delete|vpn-details}" >&2
+    echo "usage: $0 {edge-analysis|snapshot-session|snmp|service-restart|offline-list|offline-flush|arp-scan|arp-scan-all|capture|live-capture|list-captures|summarize|summarize-upload|interface-status|wireless-scan|tinysa-config|collector-name|vpn-list|vpn-import|vpn-up|vpn-down|vpn-delete|vpn-details}" >&2
     exit 2
     ;;
 esac

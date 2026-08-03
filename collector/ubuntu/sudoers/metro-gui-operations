@@ -1,0 +1,1 @@
+metro-agent ALL=(root) NOPASSWD: /opt/nms-collector/nms-gui-operations.sh *

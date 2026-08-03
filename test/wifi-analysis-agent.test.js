@@ -10,6 +10,7 @@ const {
     attachMeasurementContext,
     buildBatch,
     classifyIncident,
+    detectTriggers,
     enteredMeasurementSession,
     frequencyToChannel,
     flushQueue,
@@ -21,6 +22,8 @@ const {
     parseRouteVerification,
     readActiveMeasurementSession,
     resolveNmsBaseUrl,
+    resolveNmsBaseUrls,
+    requestWithNmsFallback,
     measurementRfProfiles,
     splitRecordsIntoBatches
 } = require('../collector/ubuntu/nms-wifi-analysis');
@@ -47,6 +50,49 @@ test('resolves the existing collector NMS_URL contract before legacy aliases', (
         NMS_PORT: '7443',
         NMS_PATH: '/collector/'
     }), 'https://nms.example:7443/collector');
+});
+
+test('Wi-Fi analysis uses a distinct fallback NMS endpoint', () => {
+    assert.deepEqual(resolveNmsBaseUrls({
+        NMS_URL: 'https://public.example:7443/',
+        NMS_FALLBACK_URL: 'https://192.168.1.33:7443/'
+    }), [
+        'https://public.example:7443',
+        'https://192.168.1.33:7443'
+    ]);
+});
+
+test('Wi-Fi analysis source supports the pinned NMS CA without disabling verification', () => {
+    const source = fs.readFileSync(
+        path.join(__dirname, '../collector/ubuntu/nms-wifi-analysis.js'),
+        'utf8'
+    );
+    assert.match(source, /NMS_CA_CERT_PATH/);
+    assert.match(source, /options\.ca = fs\.readFileSync/);
+});
+
+test('Wi-Fi analysis remembers a working fallback endpoint', async () => {
+    const attempts = [];
+    const result = await requestWithNmsFallback({
+        NMS_URL: 'https://blocked.example:7443',
+        NMS_FALLBACK_URL: 'https://192.168.1.33:7443'
+    }, async (baseUrl) => {
+        attempts.push(baseUrl);
+        if (baseUrl.includes('blocked')) throw new Error('timeout');
+        return 'sent';
+    });
+    assert.equal(result, 'sent');
+    assert.deepEqual(attempts, [
+        'https://blocked.example:7443',
+        'https://192.168.1.33:7443'
+    ]);
+    assert.equal(
+        resolveNmsBaseUrls({
+            NMS_URL: 'https://blocked.example:7443',
+            NMS_FALLBACK_URL: 'https://192.168.1.33:7443'
+        })[0],
+        'https://192.168.1.33:7443'
+    );
 });
 
 test('parses successful and failed ping output without inventing latency', () => {
@@ -109,6 +155,37 @@ test('classification distinguishes common path and wireless-only failures', () =
     ], 'packet_loss_burst').classification, 'wireless_or_ap_path');
 });
 
+test('classification ignores disconnected wireless and identifies wired gateway failure', () => {
+    const records = [
+        { kind: 'wifi', observed_at: '2026-07-29T08:33:00Z', connected: false },
+        { kind: 'connectivity', observed_at: '2026-07-29T08:33:01Z', target_kind: 'gateway', interface_role: 'wired', success: false },
+        { kind: 'connectivity', observed_at: '2026-07-29T08:33:01Z', target_kind: 'google_dns', interface_role: 'wired', success: false },
+        { kind: 'connectivity', observed_at: '2026-07-29T08:32:59Z', target_kind: 'google_dns', interface_role: 'wireless', success: false }
+    ];
+    assert.equal(classifyIncident(records, 'packet_loss_burst').classification, 'gateway_or_wired_path');
+});
+
+test('wired gateway latency triggers after three consecutive samples above the LAN threshold', () => {
+    const triggered = [];
+    const state = { failures: new Map(), highLatency: new Map(), previousWifi: null, previousRfAverage: null };
+    const incidents = { trigger: (...args) => triggered.push(args) };
+    for (const latency of [10, 45, 55, 70]) {
+        detectTriggers([{
+            kind: 'connectivity',
+            observed_at: '2026-07-31T12:22:00.000Z',
+            interface_role: 'wired',
+            target_kind: 'gateway',
+            route_verified: true,
+            success: true,
+            latency_ms: latency
+        }], state, incidents, {});
+    }
+    assert.equal(triggered.length, 1);
+    assert.equal(triggered[0][0], 'gateway_latency_degraded');
+    assert.equal(triggered[0][1].threshold_ms, 20);
+    assert.equal(triggered[0][1].consecutive_samples, 3);
+});
+
 test('batch separates normalized sample families', () => {
     const sessionId = '2bb9b1a0-8322-4d4c-8781-c78d5654a366';
     const batch = buildBatch([
@@ -121,6 +198,9 @@ test('batch separates normalized sample families', () => {
     assert.equal(batch.wifi_samples.length, 1);
     assert.equal(batch.rf_sweeps.length, 1);
     assert.equal('measurement_session_id' in batch.wifi_samples[0], false);
+    assert.equal(batch.timeseries.interval_seconds, 30);
+    assert.match(batch.timeseries.window_started_at, /Z$/);
+    assert.match(batch.timeseries.window_ended_at, /Z$/);
 });
 
 test('active measurement session reader accepts running manifests only', () => {

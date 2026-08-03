@@ -13,8 +13,9 @@ const {
     validateConfig
 } = require('../collector/ubuntu/metro-agent-v1');
 const { parsePingOutput } = require('../collector/ubuntu/metro-agent-v1/plugins/ping');
-const { parseTarget } = require('../collector/ubuntu/metro-agent-v1/plugins/tcp');
+const { parseTarget, run: runTcpCheck } = require('../collector/ubuntu/metro-agent-v1/plugins/tcp');
 const { parseMeminfo } = require('../collector/ubuntu/metro-agent-v1/plugins/system');
+const { requestJson } = require('../collector/ubuntu/metro-agent-v1/lib/transport');
 
 function sampleConfig(overrides = {}) {
     return {
@@ -48,7 +49,28 @@ test('Metro Agent batch carries source semantics and config revision', () => {
     assert.equal(batch.config_revision, 3);
     assert.equal(batch.hostname, 'field-130');
     assert.equal(batch.metadata.result_semantics, 'missing-is-not-zero');
+    assert.equal(batch.metadata.timeseries.interval_seconds, 60);
+    assert.equal(batch.metadata.timeseries.window_started_at, '2026-07-24T00:00:00.000Z');
+    assert.equal(batch.metadata.timeseries.window_ended_at, '2026-07-24T00:01:00.000Z');
     assert.match(batch.batch_id, /^[0-9a-f-]{36}$/);
+});
+
+test('TCP plugin preserves path role and required semantics', async () => {
+    const socket = new (require('node:events').EventEmitter)();
+    socket.setTimeout = () => {};
+    socket.destroy = () => {};
+    const pending = runTcpCheck({
+        key: 'central_nms_vpn',
+        target: '192.168.1.33:7443',
+        timeout_ms: 1000,
+        options: { path_role: 'vpn', required: true }
+    }, {
+        connect: () => socket
+    });
+    socket.emit('connect');
+    const [result] = await pending;
+    assert.equal(result.details.path_role, 'vpn');
+    assert.equal(result.details.required, true);
 });
 
 test('plugin plan isolates one plugin failure from other checks', async () => {
@@ -67,6 +89,27 @@ test('plugin plan isolates one plugin failure from other checks', async () => {
     assert.equal(results[0].status, 'success');
     assert.equal(results[1].status, 'failure');
     assert.equal(results[1].error_code, 'plugin_failed');
+});
+
+test('plugin checks run in parallel so one slow endpoint does not consume the whole service timeout', async () => {
+    let running = 0;
+    let peak = 0;
+    const plugin = {
+        run: async (check) => {
+            running += 1;
+            peak = Math.max(peak, running);
+            await new Promise((resolve) => setTimeout(resolve, 15));
+            running -= 1;
+            return [{ result_id: check.key, check_key: check.key, check_type: 'system', status: 'success' }];
+        }
+    };
+    await executePlan(sampleConfig({
+        checks: [
+            { key: 'first', type: 'system' },
+            { key: 'second', type: 'system' }
+        ]
+    }), { plugins: { system: plugin } });
+    assert.equal(peak, 2);
 });
 
 test('runOnce caches config and retains failed uploads for later flush', async () => {
@@ -131,4 +174,11 @@ test('ping and TCP parsers retain units and endpoints', () => {
 test('system memory uses Linux MemAvailable rather than treating cache as used', () => {
     assert.equal(parseMeminfo('MemTotal:       1000000 kB\nMemAvailable:    750000 kB\n'), 25);
     assert.equal(parseMeminfo('MemTotal:       1000000 kB\n'), null);
+});
+
+test('transport enforces an absolute request deadline', async () => {
+    await assert.rejects(
+        requestJson('http://192.0.2.1:81/test', { timeoutMs: 25 }),
+        /deadline|timed out|connect/
+    );
 });

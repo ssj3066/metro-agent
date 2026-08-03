@@ -532,6 +532,7 @@ class App:
         self.collector_name_status = tk.StringVar(value="저장하면 다음 heartbeat부터 중앙 표시명에 반영됩니다.")
         self.pending_collector_name = None
         self.field_profile_name = tk.StringVar()
+        self.field_profile_confirmed = False
         self.field_site_name = tk.StringVar()
         self.metro_contact_name = tk.StringVar()
         self.metro_contact_phone = tk.StringVar()
@@ -613,7 +614,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(150, self._drain)
         self.root.after(350, self.refresh_status)
-        self.root.after(700, self.refresh_assigned_sites)
+        self.site_sync_job = self.root.after(700, self._scheduled_site_sync)
         self.root.after(900, self.refresh_tinysa_config_state)
 
     def _configure_style(self):
@@ -736,7 +737,7 @@ class App:
         ttk.Label(saved, text="현장 선택").grid(row=0, column=0, sticky="w")
         self.field_profile_box = ttk.Combobox(saved, textvariable=self.field_profile_name, state="readonly", width=42)
         self.field_profile_box.grid(row=0, column=1, sticky="ew", padx=(8, 8))
-        self.field_profile_box.bind("<<ComboboxSelected>>", lambda _event: self._load_selected_field_profile())
+        self.field_profile_box.bind("<<ComboboxSelected>>", self._confirm_selected_field_profile)
         ttk.Button(saved, text="119 새로고침", command=self.refresh_assigned_sites).grid(row=0, column=2, padx=3)
         ttk.Label(saved, textvariable=self.ict_connection_status).grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(5, 0))
         saved.columnconfigure(1, weight=1)
@@ -827,6 +828,29 @@ class App:
         self.field_profile_name.set(self._profile_display_name(profile))
         self.active_profile_label.set(f"현재 측정 현장: {self.field_site_name.get().strip()}")
 
+    def _confirm_selected_field_profile(self, _event=None):
+        self.field_profile_confirmed = True
+        self._load_selected_field_profile()
+        self._reset_site_measurement_view()
+
+    def _reset_site_measurement_view(self):
+        self.measurement_status.set("새 현장 · 테스트 안 됨")
+        if hasattr(self, "measurement_output"):
+            self._set_text(
+                self.measurement_output,
+                "선택한 현장의 측정 결과가 아직 없습니다.\n"
+                "동시 측정 또는 진단 저장을 실행하면 새 값으로 채워집니다.\n",
+            )
+        self.live_monitor_previous = None
+        self.live_monitor_previous_at = None
+        self.live_monitor_status.set("새 현장 · 모니터링 시작 전")
+        for variable in getattr(self, "live_metric_vars", {}).values():
+            variable.set("-")
+        if hasattr(self, "live_neighbor_tree"):
+            for row in self.live_neighbor_tree.get_children():
+                self.live_neighbor_tree.delete(row)
+        self.live_network.set("새 현장 · 인터페이스를 선택하고 모니터링을 시작하세요.")
+
     def _ict_client(self):
         return IctFieldClient(
             load_device_config(ICT_DEVICE_CONFIG),
@@ -846,6 +870,10 @@ class App:
             except Exception as exc:
                 self.events.put(("119 현장 조회", 1, str(exc)))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _scheduled_site_sync(self):
+        self.refresh_assigned_sites()
+        self.site_sync_job = self.root.after(60_000, self._scheduled_site_sync)
 
     def _merge_assigned_sites(self, payload, mode):
         existing = {int(item.get("site_id") or 0): item for item in self.field_profiles}
@@ -874,7 +902,8 @@ class App:
         current = self.field_profile_name.get()
         names = [self._profile_display_name(item) for item in merged]
         if current not in names:
-            self.field_profile_name.set(names[0] if names else "")
+            self.field_profile_name.set("")
+            self.field_profile_confirmed = False
         self._load_selected_field_profile()
 
     def _load_selected_field_profile(self):
@@ -885,6 +914,7 @@ class App:
 
     def _new_field_profile(self):
         self.field_profile_name.set("")
+        self.field_profile_confirmed = False
         self.field_site_name.set(""); self.metro_contact_name.set(""); self.metro_contact_phone.set("")
         self.customer_contact_name.set(""); self.customer_contact_phone.set("")
         self.active_profile_label.set("새 현장 프로필을 입력하고 저장하세요.")
@@ -892,6 +922,13 @@ class App:
     def _save_field_profile(self):
         profile = self._field_profile_from_form()
         if not profile:
+            return
+        if not self.field_profile_confirmed:
+            self.show_page("현장 프로필")
+            messagebox.showerror(
+                "현장 선택 확인",
+                "이전 현장 데이터 혼입을 막기 위해 현장 목록에서 이번 측정 현장을 직접 선택하세요.",
+            )
             return
         site_name = profile["site_name"]
         self.field_profiles = [
@@ -1102,7 +1139,7 @@ class App:
         bar=ttk.Frame(devices); bar.pack(fill="x",pady=(8,0))
         ttk.Button(bar,text="장비 추가",command=self.add_target).pack(side="left")
         ttk.Button(bar,text="선택 삭제",command=self.remove_target).pack(side="left",padx=5)
-        ttk.Button(bar,text="지금 수집",command=lambda:self.privileged([NODE,COLLECTOR,"edge-analysis"])).pack(side="right")
+        ttk.Button(bar,text="지금 수집",command=lambda:self.privileged([GUI_OPS,"edge-analysis"])).pack(side="right")
 
     def _diag_tab(self):
         tab=self._new_page("네트워크 진단")
@@ -1147,7 +1184,7 @@ class App:
         self.wireless_analysis=tk.Text(analysis,height=7,wrap="word",state="disabled",font=("monospace",10)); self.wireless_analysis.pack(fill="x")
 
     def refresh_wireless(self):
-        self.async_run("무선 분석",[GUI_OPS,"wireless-scan"],timeout=45)
+        self.async_run("무선 분석",["sudo","-n",GUI_OPS,"wireless-scan"],timeout=45)
 
     def show_wireless_ap_detail(self, _event=None):
         selected=self.wireless_tree.selection()
@@ -1571,7 +1608,22 @@ class App:
         ttk.Label(controls,text="모듈 하나가 실패해도 성공한 측정은 보존되며 최종 상태는 완료·부분완료·실패로 구분됩니다.").grid(row=4,column=0,columnspan=6,sticky="w",pady=(4,0))
         ttk.Label(controls,textvariable=self.active_profile_label).grid(row=5,column=0,columnspan=5,sticky="w",pady=(8,0))
         ttk.Button(controls,text="현장 프로필",command=lambda:self.show_page("현장 프로필")).grid(row=5,column=5,sticky="e",pady=(8,0))
-        self.measurement_output=tk.Text(tab,wrap="none",state="disabled",font=("monospace",10)); self.measurement_output.pack(fill="both",expand=True,pady=(10,0))
+        self.measurement_output=tk.Text(tab,wrap="none",state="disabled",font=("monospace",10),height=12); self.measurement_output.pack(fill="both",expand=True,pady=(10,8))
+        archive=ttk.LabelFrame(tab,text="지난 측정 기록",padding=8); archive.pack(fill="x")
+        archive_actions=ttk.Frame(archive); archive_actions.pack(fill="x",pady=(0,6))
+        ttk.Button(archive_actions,text="목록 새로고침",command=self.refresh_measurement_archive).pack(side="left")
+        ttk.Button(archive_actions,text="상세 열람",command=self.show_measurement_archive).pack(side="left",padx=5)
+        ttk.Button(archive_actions,text="로컬 기록 삭제",style="Danger.TButton",command=self.delete_measurement_archive).pack(side="left")
+        ttk.Label(archive_actions,text="중앙 119 기록 삭제는 119 수집 데이터 화면에서 관리자만 수행합니다.",style="Meta.TLabel").pack(side="right")
+        columns=("customer","site","status","started","duration","session")
+        self.measurement_archive_tree=ttk.Treeview(archive,columns=columns,show="headings",height=5)
+        headings={"customer":"고객사","site":"현장","status":"상태","started":"시작","duration":"측정시간","session":"세션 ID"}
+        widths={"customer":145,"site":175,"status":75,"started":145,"duration":75,"session":250}
+        for column in columns:
+            self.measurement_archive_tree.heading(column,text=headings[column])
+            self.measurement_archive_tree.column(column,width=widths[column],minwidth=60,stretch=column in ("customer","site","session"))
+        self.measurement_archive_tree.pack(fill="x")
+        self.root.after(300,self.refresh_measurement_archive)
 
     def measurement_seconds(self):
         try: value=int(self.measurement_value.get()); interval=int(self.measurement_interval.get())
@@ -1622,6 +1674,9 @@ class App:
         labels={"pause":"동시 측정 일시정지","resume":"동시 측정 계속","stop":"동시 측정 안전중지"}
         if action=="stop" and not messagebox.askyesno("안전 중지","현재 동시 측정을 안전하게 종료할까요?"):
             return
+        if action=="stop":
+            self.measurement_status.set("안전 종료 요청 중")
+            self.root.after(500,self.refresh_measurement_session)
         self.async_run(labels[action],["sudo","-n",MEASUREMENT_CONTROL,action],timeout=60)
 
     def refresh_measurement_session(self):
@@ -1633,6 +1688,51 @@ class App:
             ["sudo","-n",MEASUREMENT_CONTROL,"status"],
             timeout=30,
         )
+
+    def refresh_measurement_archive(self):
+        if not os.path.isfile(MEASUREMENT_CONTROL):
+            self.measurement_status.set("동시 측정 실행 모듈 누락")
+            return
+        self.async_run("측정 기록 목록",["sudo","-n",MEASUREMENT_CONTROL,"list"],timeout=30)
+
+    def _selected_measurement_archive_id(self):
+        selected=self.measurement_archive_tree.selection() if hasattr(self,"measurement_archive_tree") else ()
+        return selected[0] if selected else None
+
+    def show_measurement_archive(self):
+        session_id=self._selected_measurement_archive_id()
+        if not session_id:
+            messagebox.showinfo("지난 측정 기록","열람할 측정 기록을 선택하세요.")
+            return
+        self.async_run("측정 기록 상세",["sudo","-n",MEASUREMENT_CONTROL,"show",session_id],timeout=30)
+
+    def delete_measurement_archive(self):
+        session_id=self._selected_measurement_archive_id()
+        if not session_id:
+            messagebox.showinfo("지난 측정 기록","삭제할 로컬 측정 기록을 선택하세요.")
+            return
+        if not messagebox.askyesno("로컬 기록 삭제","수집기 안의 선택 기록을 삭제할까요? 119 중앙 기록은 유지됩니다."):
+            return
+        self.async_run("측정 기록 삭제",["sudo","-n",MEASUREMENT_CONTROL,"delete",session_id],timeout=30)
+
+    def _update_measurement_archive(self, sessions):
+        if not hasattr(self,"measurement_archive_tree"):
+            return
+        for item in self.measurement_archive_tree.get_children():
+            self.measurement_archive_tree.delete(item)
+        labels={"completed":"완료","partial":"부분 완료","failed":"실패","cancelled":"취소","running":"측정 중","paused":"일시 정지","stopping":"종료 중","preflight":"사전 점검"}
+        for session in sessions:
+            session_id=str(session.get("measurement_session_id") or "")
+            started=str(session.get("started_at") or session.get("created_at") or "").replace("T"," ").replace("Z","")[:19]
+            duration=session.get("duration_seconds")
+            self.measurement_archive_tree.insert("","end",iid=session_id,values=(
+                session.get("customer_name") or "미지정",
+                session.get("site_name") or "미지정",
+                labels.get(str(session.get("status") or ""),session.get("status") or "unknown"),
+                started or "시각 없음",
+                f"{duration}초" if duration is not None else "-",
+                session_id,
+            ))
 
     def _update_measurement_session_status(self, payload):
         state=payload.get("status") or "unknown"
@@ -1648,9 +1748,13 @@ class App:
         preflight=payload.get("preflight") or {}
         clock=preflight.get("clock") if isinstance(preflight,dict) else {}
         ntp_state=(clock or {}).get("ntp_state") or preflight.get("ntp_state")
+        server_clock_state=(clock or {}).get("server_clock_state")
         clock_warning=""
         if ntp_state in ("degraded","unsynced","unknown"):
             clock_warning=f" · 시간동기화 {ntp_state}"
+        elif server_clock_state=="unsynced":
+            reliable_delta=(clock or {}).get("server_clock_reliable_delta_ms")
+            clock_warning=f" · 중앙시각 오차 {reliable_delta:g}ms" if isinstance(reliable_delta,(int,float)) else " · 중앙시각 확인 필요"
         self.measurement_status.set(f"{labels.get(state,state)}{suffix}{clock_warning}{worker}")
 
     def _offline_queue_tab(self):
@@ -1668,10 +1772,10 @@ class App:
         ttk.Label(bar,textvariable=self.queue_status).pack(side="right")
 
     def refresh_offline_queue(self):
-        self.privileged([NODE,COLLECTOR,"offline-measurements","list"],label="오프라인 큐 조회")
+        self.privileged([GUI_OPS,"offline-list"],label="오프라인 큐 조회")
 
     def flush_offline_queue(self):
-        self.privileged([NODE,COLLECTOR,"offline-measurements","flush"],label="미전송 결과 전송",timeout=180)
+        self.privileged([GUI_OPS,"offline-flush"],label="미전송 결과 전송",timeout=180)
         self.retry_ict_queue()
 
     def retry_ict_queue(self):
@@ -1717,7 +1821,7 @@ class App:
         action = "저장 후 중앙으로 송신" if send_immediately else "로컬 대기열에 저장"
         if not messagebox.askyesno("현장 진단 스냅샷", f"{profile['site_name']}의 현재 진단값을 {action}할까요?"):
             return
-        command = [NODE, COLLECTOR, "snapshot-session", "--field-profile-stdin"]
+        command = [GUI_OPS, "snapshot-session"]
         if send_immediately:
             command.append("--send")
         self.pending_snapshot_profile = profile
@@ -1733,6 +1837,7 @@ class App:
             return
         self.refresh_batch_pending = {"현황", "VPN 목록", "무선 분석", "오프라인 큐 조회"}
         self.refresh_batch_errors = 0
+        self.refresh_batch_error_labels = []
         self.refresh_all_button.configure(state="disabled")
         self.status.set("전체 새로고침 중")
         self.refresh_services()
@@ -1768,7 +1873,7 @@ class App:
         ttk.Spinbox(batch,from_=5,to=120,textvariable=self.capture_seconds,width=7).pack(side="left",padx=5)
         ttk.Button(batch,text="단기 캡처",command=self.start_capture).pack(side="left")
         ttk.Button(batch,text="저장 목록",command=self.list_captures).pack(side="left",padx=5)
-        ttk.Button(batch,text="선택 경로 요약",command=self.summarize_capture).pack(side="right")
+        ttk.Button(batch,text="선택 요약/전송",command=self.summarize_capture).pack(side="right")
         self.capture_output=tk.Text(tab,height=5,wrap="none",state="disabled",font=("monospace",9)); self.capture_output.pack(fill="x",pady=(8,0))
         self.refresh_interfaces()
 
@@ -1812,27 +1917,27 @@ class App:
             self.events.put((label,p.returncode,p.stdout+p.stderr))
         except Exception as e: self.events.put((label,1,str(e)))
     def privileged(self,cmd,input_text=None,label="관리자 작업",timeout=120):
-        self.async_run(label,["pkexec",*cmd],input_text,timeout)
+        self.async_run(label,["sudo","-n",*cmd],input_text,timeout)
     def refresh_status(self):
         cmd=["bash","-lc",NETWORK_STATUS_COMMAND]
         self.async_run("현황",cmd)
-    def load_snmp(self): self.privileged([HELPER,"show-json"],label="SNMP 설정 조회")
-    def save_defaults(self): self.privileged([HELPER,"defaults",self.version.get(),self.port.get(),self.timeout.get(),self.retries.get()],label="SNMP 기본값 저장")
+    def load_snmp(self): self.privileged([GUI_OPS,"snmp","show-json"],label="SNMP 설정 조회")
+    def save_defaults(self): self.privileged([GUI_OPS,"snmp","defaults",self.version.get(),self.port.get(),self.timeout.get(),self.retries.get()],label="SNMP 기본값 저장")
     def change_community(self):
         value=simpledialog.askstring("SNMP Community","읽기 전용 Community를 입력하세요.",show="*")
-        if value: self.privileged([HELPER,"community","--stdin"],value+"\n","Community 변경")
+        if value: self.privileged([GUI_OPS,"snmp","community","--stdin"],value+"\n","Community 변경")
     def add_target(self):
         name=simpledialog.askstring("장비 추가","장비명")
         if not name:return
         host=simpledialog.askstring("장비 추가","IP 주소 또는 호스트명")
         if not host or not valid_host(host): messagebox.showerror("입력 오류","올바른 IP 주소 또는 호스트명을 입력하세요."); return
         role=simpledialog.askstring("장비 추가","역할 (예: core_switch)",initialvalue="switch") or "switch"
-        self.privileged([HELPER,"add",name.strip(),host.strip(),role.strip()],label="SNMP 장비 추가")
+        self.privileged([GUI_OPS,"snmp","add",name.strip(),host.strip(),role.strip()],label="SNMP 장비 추가")
     def remove_target(self):
         item=self.tree.focus()
         if not item:return
         host=self.tree.item(item,"values")[1]
-        if messagebox.askyesno("장비 삭제",f"{host} 장비를 삭제할까요?"): self.privileged([HELPER,"remove",host],label="SNMP 장비 삭제")
+        if messagebox.askyesno("장비 삭제",f"{host} 장비를 삭제할까요?"): self.privileged([GUI_OPS,"snmp","remove",host],label="SNMP 장비 삭제")
     def run_diag(self,label):
         if label in ("경로 추적","포트 점검") and not valid_host(self.target.get()): messagebox.showerror("입력 오류","진단 대상 IP/호스트를 확인하세요."); return
         self.async_run(label,["bash","-lc",COMMANDS[label]])
@@ -1846,8 +1951,7 @@ class App:
         if preferred and self.interface.get() not in values:self.interface.set(preferred)
         if preferred and self.live_monitor_interface.get() not in values:self.live_monitor_interface.set(preferred)
     def arp_scan(self):
-        if not self.interface.get(): messagebox.showerror("인터페이스 없음","사용할 네트워크 인터페이스가 없습니다."); return
-        self.privileged([GUI_OPS,"arp-scan",self.interface.get()],label="전체 ARP 검색")
+        self.async_run("전체 ARP 검색",["sudo","-n",GUI_OPS,"arp-scan-all"])
     def start_capture(self):
         try: seconds=int(self.capture_seconds.get())
         except ValueError: seconds=0
@@ -1877,7 +1981,7 @@ class App:
         self.live_flood_counts=empty_counts()
         self.live_flood_started_at=time.monotonic()
         self.live_flood_status.set("플러딩 분석 준비 중")
-        command=["pkexec",GUI_OPS,"live-capture",self.interface.get(),profile,str(minutes*60)]
+        command=["sudo","-n",GUI_OPS,"live-capture",self.interface.get(),profile,str(minutes*60)]
         try:
             self.live_capture_process=subprocess.Popen(
                 command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
@@ -1924,7 +2028,7 @@ class App:
     def _stop_live_capture_worker(self, process):
         try:
             result=subprocess.run(
-                ["pkexec",GUI_OPS,"stop-live-capture",str(process.pid)],
+                ["sudo","-n",GUI_OPS,"stop-live-capture",str(process.pid)],
                 capture_output=True,text=True,timeout=15,check=False,
             )
             text=(result.stdout or result.stderr or "").strip()
@@ -1987,7 +2091,7 @@ class App:
         except tk.TclError: selected=""
         path=next((part for part in selected.split() if part.startswith("/var/log/nms-pcap/") and part.endswith((".pcap",".pcapng"))),"")
         if not path: messagebox.showinfo("캡처 선택","목록에서 PCAP 파일 경로를 마우스로 선택하세요."); return
-        self.privileged([GUI_OPS,"summarize",path],label="캡처 요약")
+        self.privileged([GUI_OPS,"summarize-upload",path],label="캡처 요약/전송",timeout=180)
     def save_result(self):
         text=self.output.get("1.0","end").strip()
         if not text:return
@@ -2028,7 +2132,7 @@ class App:
             self.service_tree.insert("", "end",values=(label,unit,p.stdout.strip() or "unknown"))
     def restart_service(self):
         item=self.service_tree.focus()
-        if item:self.privileged(["/bin/systemctl","restart",self.service_tree.item(item,"values")[1]],label="서비스 재시작")
+        if item:self.privileged([GUI_OPS,"service-restart",self.service_tree.item(item,"values")[1]],label="서비스 재시작")
     def _drain(self):
         try:
             label,code,text=self.events.get_nowait()
@@ -2172,6 +2276,33 @@ class App:
                     self._set_text(self.measurement_output,f"$ {label}\n{text}\n",append=True)
                 if label=="동시 측정 시작":
                     self.pending_measurement_profile=None
+                if code==0:
+                    self.root.after(300,self.refresh_measurement_archive)
+            elif label=="측정 기록 목록":
+                if code==0:
+                    try:
+                        payload=json.loads(text)
+                        self._update_measurement_archive(payload.get("sessions") or [])
+                    except (ValueError,json.JSONDecodeError):
+                        self.measurement_status.set("측정 기록 목록 형식 오류")
+                else:
+                    self.measurement_status.set("측정 기록 목록 조회 실패")
+            elif label=="측정 기록 상세":
+                if code==0:
+                    try:
+                        payload=json.loads(text)
+                        self._update_measurement_session_status(payload)
+                        self._set_text(self.measurement_output,f"{format_measurement_session_result(payload)}\n\n[상세 JSON]\n{json.dumps(payload,ensure_ascii=False,indent=2)}\n")
+                    except (ValueError,json.JSONDecodeError):
+                        self._set_text(self.measurement_output,text+"\n")
+                else:
+                    messagebox.showerror("측정 기록 열람",text or "측정 기록을 불러오지 못했습니다.")
+            elif label=="측정 기록 삭제":
+                if code==0:
+                    self.measurement_status.set("로컬 측정 기록 삭제 완료")
+                    self.root.after(200,self.refresh_measurement_archive)
+                else:
+                    messagebox.showerror("측정 기록 삭제",text or "실행 중인 세션은 삭제할 수 없습니다.")
             elif label=="SNMP 설정 조회" and code==0:
                 data=parse_settings(text); self.version.set(data.get("version","2c")); self.port.set(data.get("port",161)); self.timeout.set(data.get("timeout",2)); self.retries.set(data.get("retries",1)); self.community_state.set("Community: 설정됨" if data.get("community_configured") else "Community: 미설정")
                 for x in self.tree.get_children():self.tree.delete(x)
@@ -2268,7 +2399,7 @@ class App:
                     if code==0 and label != "VPN 상세":self.root.after(500,self.refresh_vpn)
                 else:
                     if label == "측정 세션": target_widget=self.measurement_output
-                    elif label in ("패킷 캡처","캡처 목록","캡처 요약"): target_widget=self.capture_output
+                    elif label in ("패킷 캡처","캡처 목록","캡처 요약","캡처 요약/전송"): target_widget=self.capture_output
                     else: target_widget=self.output
                 if hasattr(self,"output"): self._set_text(target_widget,f"$ {label}\n{text}\n",append=True)
                 if code==0 and label.startswith("SNMP"): self.root.after(300,self.load_snmp)
@@ -2288,9 +2419,13 @@ class App:
                 self.refresh_batch_pending.discard(label)
                 if code != 0:
                     self.refresh_batch_errors += 1
+                    self.refresh_batch_error_labels.append(label)
                 if not self.refresh_batch_pending:
                     stamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    suffix=f" · 오류 {self.refresh_batch_errors}건" if self.refresh_batch_errors else " · 정상"
+                    suffix=(
+                        f" · 오류: {', '.join(self.refresh_batch_error_labels)}"
+                        if self.refresh_batch_errors else " · 정상"
+                    )
                     self.last_refresh.set(f"마지막 갱신: {stamp}{suffix}")
                     self.refresh_all_button.configure(state="normal")
             if self.running_jobs:

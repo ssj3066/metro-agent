@@ -1073,6 +1073,22 @@ function calculateIpv4Subnet(address, prefixlen) {
     return integerToIpv4(numericAddress & mask);
 }
 
+function isIpv4InSubnet(address, networkAddress, prefixlen) {
+    const numericAddress = ipv4ToInteger(address);
+    const numericNetwork = ipv4ToInteger(networkAddress);
+    const prefix = normalizeIpv4Prefix(prefixlen);
+    if (numericAddress === null || numericNetwork === null || prefix === null) return false;
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    return (numericAddress & mask) === (numericNetwork & mask);
+}
+
+function pulseHostMatchesPrimarySubnet(env, primaryNetwork = collectPrimaryNetwork()) {
+    if (!parseBoolean(env.PULSE_LOCAL_REQUIRE_PRIMARY_SUBNET, true)) return true;
+    const host = String(env.PULSE_LOCAL_HOST || '').trim();
+    if (!host || !primaryNetwork?.address || primaryNetwork.prefixlen === null) return false;
+    return isIpv4InSubnet(host, primaryNetwork.address, primaryNetwork.prefixlen);
+}
+
 function collectPrimaryNetwork(execFn = execFileSync) {
     const routes = parseJsonCommand('ip', ['-j', '-4', 'route', 'get', '1.1.1.1'], execFn) || [];
     const route = Array.isArray(routes) ? routes[0] || {} : {};
@@ -1175,6 +1191,85 @@ function isPrivateIpv4Address(value) {
         || (a === 192 && b === 168)
         || (a === 169 && b === 254)
         || (a === 100 && b >= 64 && b <= 127);
+}
+
+function isPublicIpv4Address(value) {
+    const normalized = String(value || '').trim();
+    if (net.isIP(normalized) !== 4 || isPrivateIpv4Address(normalized)) {
+        return false;
+    }
+    const [a] = normalized.split('.').map(Number);
+    return a > 0 && a < 224;
+}
+
+function requestPublicIpText(targetUrl, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(targetUrl);
+        const client = parsed.protocol === 'http:' ? http : https;
+        const request = client.get(parsed, {
+            headers: { Accept: 'text/plain, application/json', 'User-Agent': 'metro-nms-collector/public-ip' },
+            timeout: timeoutMs
+        }, (response) => {
+            let body = '';
+            response.setEncoding('utf8');
+            response.on('data', (chunk) => {
+                if (body.length < 4096) body += chunk;
+            });
+            response.on('end', () => {
+                if (response.statusCode < 200 || response.statusCode >= 300) {
+                    reject(new Error(`HTTP ${response.statusCode}`));
+                    return;
+                }
+                resolve(body.trim());
+            });
+        });
+        request.on('timeout', () => request.destroy(new Error('timeout')));
+        request.on('error', reject);
+    });
+}
+
+async function collectPublicIpv4(env, requestFn = requestPublicIpText) {
+    if (!parseBoolean(env.PUBLIC_IP_COLLECTION_ENABLED, true)) {
+        return { value: null, status: 'disabled', source: null, observed_at: new Date().toISOString() };
+    }
+    const endpoints = parseCsv(env.PUBLIC_IP_ENDPOINTS || 'https://api.ipify.org,https://ifconfig.me/ip');
+    const timeoutMs = Math.max(500, Math.min(10000, Number(env.PUBLIC_IP_TIMEOUT_MS || 3000)));
+    const errors = [];
+    for (const endpoint of endpoints) {
+        try {
+            const body = await requestFn(endpoint, timeoutMs);
+            let candidate = String(body || '').trim();
+            if (candidate.startsWith('{')) {
+                candidate = String(JSON.parse(candidate).ip || '').trim();
+            }
+            if (isPublicIpv4Address(candidate)) {
+                return {
+                    value: candidate,
+                    status: 'collected',
+                    source: new URL(endpoint).hostname,
+                    observed_at: new Date().toISOString()
+                };
+            }
+            errors.push(`${new URL(endpoint).hostname}:invalid`);
+        } catch (error) {
+            errors.push(`${new URL(endpoint).hostname}:${error.message}`);
+        }
+    }
+    return {
+        value: null,
+        status: 'unavailable',
+        source: null,
+        observed_at: new Date().toISOString(),
+        error_count: errors.length
+    };
+}
+
+async function attachPublicIpObservation(payload, env, requestFn = requestPublicIpText) {
+    const observation = await collectPublicIpv4(env, requestFn);
+    payload.metadata = payload.metadata || {};
+    payload.metadata.public_ip_observation = observation;
+    if (observation.value) payload.public_ip = observation.value;
+    return payload;
 }
 
 function isLikelyHostname(value) {
@@ -1921,6 +2016,94 @@ async function runTcpdumpDiagnostic(command, env) {
     };
 }
 
+async function analyzeExistingPacketCapture(filePath) {
+    const resolvedPath = path.resolve(String(filePath || '').trim());
+    const allowedRoot = '/var/log/nms-pcap/';
+    if (!resolvedPath.startsWith(allowedRoot) || !/\.pcap(?:ng)?$/i.test(resolvedPath)) {
+        throw new Error('packet capture path must be under /var/log/nms-pcap');
+    }
+    if (!fs.existsSync(resolvedPath)) throw new Error('packet capture file was not found');
+
+    const commonFieldArgs = [
+        '-r', resolvedPath, '-T', 'fields',
+        '-E', 'separator=\t', '-E', 'quote=n', '-E', 'occurrence=f'
+    ];
+    const packetRows = await runExecFile('tshark', [
+        ...commonFieldArgs,
+        '-e', 'frame.time_epoch', '-e', 'frame.len',
+        '-e', 'eth.src', '-e', 'eth.dst',
+        '-e', 'ip.src', '-e', 'ip.dst',
+        '-e', 'ipv6.src', '-e', 'ipv6.dst',
+        '-e', '_ws.col.Protocol',
+        '-e', 'tcp.srcport', '-e', 'tcp.dstport',
+        '-e', 'udp.srcport', '-e', 'udp.dstport',
+        '-e', 'vlan.id',
+        '-e', 'arp.src.proto_ipv4', '-e', 'arp.dst.proto_ipv4'
+    ], { timeoutMs: 60000, maxBuffer: 16 * 1024 * 1024, preserveWhitespace: true });
+    const detailRows = await runExecFile('tshark', [
+        ...commonFieldArgs,
+        '-e', 'tcp.flags.syn', '-e', 'tcp.flags.ack', '-e', 'tcp.flags.reset',
+        '-e', 'tcp.analysis.retransmission',
+        '-e', 'dns.flags.response', '-e', 'dns.flags.rcode', '-e', 'dns.qry.name',
+        '-e', 'arp.opcode', '-e', 'icmp.type',
+        '-e', 'lldp.tlv.system.name', '-e', 'cdp.deviceid'
+    ], { timeoutMs: 60000, maxBuffer: 16 * 1024 * 1024, preserveWhitespace: true });
+    if (!packetRows.ok) throw new Error(packetRows.stderr || 'tshark packet analysis failed');
+
+    const packetStats = parseTsharkPacketRows(packetRows.stdout);
+    const detailStats = detailRows.ok ? parseTsharkDetailRows(detailRows.stdout) : parseTsharkDetailRows('');
+    const fileStat = fs.statSync(resolvedPath);
+    const measuredAt = new Date(fileStat.mtimeMs - (packetStats.observed_duration_seconds * 1000));
+    const filename = path.basename(resolvedPath);
+    const profileMatch = filename.match(/^(?:live|gui)-([a-z0-9_]+)-\d{8}-/i);
+    return {
+        ok: true,
+        source: 'tshark_existing_pcap_summary',
+        packet_analysis: {
+            schema_version: 'collector-packet-analysis-v1',
+            available: true,
+            source: 'tshark_existing_pcap_summary',
+            measured_at: measuredAt.toISOString(),
+            interface: null,
+            profile: profileMatch?.[1] || 'manual',
+            capture_filter: null,
+            capture_scope: 'collector_interface',
+            capture_scope_notice: '수집기 인터페이스에서 관측한 값입니다. 전체 현장 확정에는 SPAN/미러 또는 트렁크 관측이 필요합니다.',
+            requested_duration_seconds: 0,
+            capture_duration_ms: Math.round(packetStats.observed_duration_seconds * 1000),
+            ...packetStats,
+            ...detailStats,
+            retransmission_interpretation: 'tshark_suspected_within_partial_capture',
+            pcap: {
+                local_filename: filename,
+                size_bytes: fileStat.size,
+                sha256: crypto.createHash('sha256').update(fs.readFileSync(resolvedPath)).digest('hex'),
+                retained_until: null
+            },
+            privacy: {
+                payload_uploaded: false,
+                raw_pcap_uploaded: false,
+                dns_query_names_in_summary: true
+            },
+            parser_errors: detailRows.ok ? [] : [detailRows.stderr || 'detail row parsing failed']
+        }
+    };
+}
+
+async function uploadPacketCaptureSummary(env, filePath) {
+    const report = inspectCollectorEnv(env);
+    if (!report.ready) throw new Error(report.errors.join('; '));
+    const result = await analyzeExistingPacketCapture(filePath);
+    const receipt = await withNmsFallback(env, (baseUrl) => ensureSuccessfulJsonPost(
+        `${baseUrl}/api/collectors/${report.collectorId}/packet-capture-results`,
+        { 'Content-Type': 'application/json', 'X-Collector-Token': String(env.COLLECTOR_TOKEN).trim() },
+        { result },
+        'collector packet capture upload failed',
+        env
+    ));
+    return { result, delivery: { state: 'sent', receipt } };
+}
+
 async function runArpwatchDiagnostic() {
     const result = await runExecFile('ip', ['neigh', 'show'], {
         timeoutMs: 10000,
@@ -2123,7 +2306,18 @@ function finalizeMeasurementMetrics(aggregates) {
     }).sort((a, b) => `${a.metric_key}:${a.target}`.localeCompare(`${b.metric_key}:${b.target}`));
 }
 
-async function runMeasurementSessionDiagnostic(command, env) {
+async function interruptibleMeasurementSleep(milliseconds, shouldStop) {
+    let remaining = Math.max(0, Number(milliseconds) || 0);
+    while (remaining > 0) {
+        if (shouldStop?.()) return false;
+        const slice = Math.min(remaining, 250);
+        await sleep(slice);
+        remaining -= slice;
+    }
+    return !shouldStop?.();
+}
+
+async function runMeasurementSessionDiagnostic(command, env, runtime = {}) {
     const requestedDurationSeconds = Math.min(28800, Math.max(10, parsePositiveInteger(command.options?.duration_seconds, 300)));
     const intervalSeconds = Math.min(300, Math.max(2, parsePositiveInteger(command.options?.interval_seconds, 10)));
     const moduleRunIds = command.options?.module_run_ids
@@ -2150,11 +2344,19 @@ async function runMeasurementSessionDiagnostic(command, env) {
     let previousInterfaces = readInterfaceCounters();
     let previousInterfaceAtMs = startedAtMs;
     let roundsCompleted = 0;
+    let interrupted = false;
 
     for (let round = 0; round < expectedRounds; round += 1) {
+        if (runtime.shouldStop?.()) {
+            interrupted = true;
+            break;
+        }
         const scheduledAtMs = startedAtMs + (round * intervalSeconds * 1000);
         const waitMs = scheduledAtMs - Date.now();
-        if (waitMs > 0) await sleep(waitMs);
+        if (waitMs > 0 && !await interruptibleMeasurementSleep(waitMs, runtime.shouldStop)) {
+            interrupted = true;
+            break;
+        }
 
         const observedAt = new Date().toISOString();
         const sample = {
@@ -2237,6 +2439,11 @@ async function runMeasurementSessionDiagnostic(command, env) {
         }
         roundsCompleted += 1;
         if (round === 0 || round === expectedRounds - 1 || round % rawSampleStride === 0) rawSamples.push(sample);
+        runtime.onProgress?.({
+            rounds_completed: roundsCompleted,
+            expected_rounds: expectedRounds,
+            observed_at: observedAt
+        });
     }
 
     const endedAtMs = Date.now();
@@ -2254,6 +2461,7 @@ async function runMeasurementSessionDiagnostic(command, env) {
             interval_seconds: intervalSeconds,
             rounds_attempted: expectedRounds,
             rounds_completed: roundsCompleted,
+            interrupted,
             targets: Object.fromEntries(pingTargets.map((item) => [item.key, item.target || null])),
             metrics: finalizeMeasurementMetrics(aggregates),
             raw_sample_retention: {
@@ -2278,8 +2486,11 @@ function buildConnectivityAssessment(steps = []) {
     const dns = findDiagnosticStep(steps, 'dns-default');
     const internetHttps = findDiagnosticStep(steps, 'internet-https');
     const nmsTcp = findDiagnosticStep(steps, 'nms-tcp');
+    const gatewayPingSummary = summarizePingStep(gatewayPing);
     const facts = {
         gateway_ping: gatewayPing ? gatewayPing.ok : null,
+        gateway_latency_ms: gatewayPingSummary?.latency_avg_ms ?? null,
+        gateway_packet_loss_pct: gatewayPingSummary?.packet_loss_pct ?? null,
         internet_ping: internetPing ? internetPing.ok : null,
         internet_ping_kt: ktInternetPing ? ktInternetPing.ok : null,
         internet_ping_google: googleInternetPing ? googleInternetPing.ok : null,
@@ -2299,6 +2510,20 @@ function buildConnectivityAssessment(steps = []) {
             summary: '기본 게이트웨이 Ping 실패',
             facts,
             missing_data: missingData
+        };
+    }
+
+    if (facts.gateway_ping === true && facts.gateway_latency_ms !== null && facts.gateway_latency_ms >= 20) {
+        return {
+            state: 'local_gateway_degraded',
+            cause_label: 'gateway_router_wan',
+            confidence: 'medium',
+            summary: `기본 게이트웨이 응답 지연 비정상 (${facts.gateway_latency_ms} ms)`,
+            facts,
+            missing_data: missingData,
+            contradictory_evidence: [
+                '게이트웨이 장비 자체 부하와 게이트웨이 연결 포트 또는 하위 경로 문제를 추가로 분리해야 함'
+            ]
         };
     }
 
@@ -2752,7 +2977,8 @@ async function runLocalMeasurementSession(
     intervalValue,
     fieldProfile,
     measurementSessionId = null,
-    moduleRunIds = {}
+    moduleRunIds = {},
+    runtime = {}
 ) {
     const report = inspectCollectorEnv(env);
     if (!report.ready) throw new Error(report.errors.join('; '));
@@ -2770,7 +2996,7 @@ async function runLocalMeasurementSession(
             timezone: 'Asia/Seoul',
             module_run_ids: moduleRunIds
         }
-    }, env);
+    }, env, runtime);
     const queued = buildQueuedFieldMeasurement(
         profile,
         result.measurement_session,
@@ -3428,6 +3654,19 @@ function buildSwitchTopology(target, execFn = execFileSync) {
     };
 }
 
+function derivePhysicalPort(interfaceRow) {
+    const candidates = [interfaceRow?.name, interfaceRow?.descr]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean);
+    for (const value of candidates) {
+        const slashMatch = value.match(/(?:^|\D)(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)\s*$/);
+        const simpleMatch = value.match(/(?:port|ethernet|eth|gi|fa|te)\s*[-_:]?\s*(\d+)\s*$/i);
+        const parsed = Number(slashMatch?.[3] || simpleMatch?.[1]);
+        if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 256) return parsed;
+    }
+    return null;
+}
+
 function runSnmpCommand(target, oid, { walk = false } = {}, execFn = execFileSync) {
     const args = [
         '-On',
@@ -3479,11 +3718,14 @@ function collectSnmpTarget(target, execFn = execFileSync) {
         name: '1.3.6.1.2.1.31.1.1.1.1',
         descr: '1.3.6.1.2.1.2.2.1.2',
         speed_bps: '1.3.6.1.2.1.2.2.1.5',
+        if_high_speed_mbps: '1.3.6.1.2.1.31.1.1.1.15',
         admin_status: '1.3.6.1.2.1.2.2.1.7',
         oper_status: '1.3.6.1.2.1.2.2.1.8',
         in_octets: '1.3.6.1.2.1.2.2.1.10',
+        in_octets_64: '1.3.6.1.2.1.31.1.1.1.6',
         in_errors: '1.3.6.1.2.1.2.2.1.14',
         out_octets: '1.3.6.1.2.1.2.2.1.16',
+        out_octets_64: '1.3.6.1.2.1.31.1.1.1.10',
         out_errors: '1.3.6.1.2.1.2.2.1.20',
         in_discards: '1.3.6.1.2.1.2.2.1.13',
         out_discards: '1.3.6.1.2.1.2.2.1.19'
@@ -3496,22 +3738,41 @@ function collectSnmpTarget(target, execFn = execFileSync) {
         }
         for (const item of parseSnmpTable(result.stdout)) {
             const row = rows.get(item.index) || { index: item.index };
-            row[key] = ['speed_bps', 'admin_status', 'oper_status', 'in_octets', 'out_octets', 'in_errors', 'out_errors', 'in_discards', 'out_discards'].includes(key)
-                ? Number(String(item.value).match(/\d+/)?.[0] || 0)
-                : item.value;
+            if (['speed_bps', 'if_high_speed_mbps', 'admin_status', 'oper_status', 'in_octets', 'in_octets_64', 'out_octets', 'out_octets_64', 'in_errors', 'out_errors', 'in_discards', 'out_discards'].includes(key)) {
+                const rawNumber = String(item.value).match(/\d+/)?.[0] || '0';
+                row[key] = Number(rawNumber);
+                if (key.endsWith('_64')) row[`${key}_raw`] = rawNumber;
+            } else {
+                row[key] = item.value;
+            }
             rows.set(item.index, row);
         }
     }
     const topology = buildSwitchTopology(target, execFn);
     const ifIndexToBasePort = Object.fromEntries(Object.entries(topology.base_port_to_if_index || {}).map(([port, ifIndex]) => [ifIndex, Number(port)]));
     const interfaces = Array.from(rows.values()).slice(0, 128).map((row) => {
-        const basePort = ifIndexToBasePort[row.index] || null;
+        const bridgeBasePort = ifIndexToBasePort[row.index] || null;
+        const physicalPort = derivePhysicalPort(row);
+        const basePort = physicalPort || bridgeBasePort;
+        const useHighCapacityCounters = row.in_octets_64_raw !== undefined
+            || row.out_octets_64_raw !== undefined;
+        const highSpeedBps = Number(row.if_high_speed_mbps || 0) * 1000000;
         return {
             ...row,
+            in_octets_32: row.in_octets ?? null,
+            out_octets_32: row.out_octets ?? null,
+            in_octets: useHighCapacityCounters ? row.in_octets_64 : row.in_octets,
+            out_octets: useHighCapacityCounters ? row.out_octets_64 : row.out_octets,
+            speed_bps_raw: row.speed_bps ?? null,
+            speed_bps: highSpeedBps > 0 ? highSpeedBps : row.speed_bps,
+            counter_bits: useHighCapacityCounters ? 64 : 32,
+            counter_source: useHighCapacityCounters ? 'ifHCInOctets/ifHCOutOctets' : 'ifInOctets/ifOutOctets',
+            bridge_base_port: bridgeBasePort,
+            physical_port: physicalPort,
             base_port: basePort,
-            pvid: basePort ? topology.pvid_by_port?.[basePort] ?? null : null,
-            stp_state: basePort ? topology.stp_state_by_port?.[basePort] ?? null : null,
-            poe: basePort ? topology.poe_ports?.find((item) => item.base_port === basePort) || null : null
+            pvid: basePort ? topology.pvid_by_port?.[basePort] ?? topology.pvid_by_port?.[bridgeBasePort] ?? null : null,
+            stp_state: basePort ? topology.stp_state_by_port?.[basePort] ?? topology.stp_state_by_port?.[bridgeBasePort] ?? null : null,
+            poe: basePort ? topology.poe_ports?.find((item) => item.base_port === basePort || item.base_port === bridgeBasePort) || null : null
         };
     });
     return {
@@ -3602,6 +3863,34 @@ function collectEdgeSnapshot(env, execFn = execFileSync) {
     };
 }
 
+function actionableNeighborIssues(snapshot) {
+    const neighbors = snapshot.network?.neighbors || {};
+    const entries = Array.isArray(neighbors.entries) ? neighbors.entries : null;
+    const interfaces = Array.isArray(snapshot.network?.interfaces) ? snapshot.network.interfaces : null;
+    if (!entries || !interfaces) {
+        return {
+            failed: Number(neighbors.state_counts?.failed || 0),
+            incomplete: Number(neighbors.state_counts?.incomplete || 0),
+            ignored: 0
+        };
+    }
+    const activeInterfaces = new Set(interfaces
+        .filter((item) => String(item.state || '').toUpperCase() === 'UP'
+            && Array.isArray(item.addresses)
+            && item.addresses.some((address) => address.scope === 'global'))
+        .map((item) => item.name));
+    const result = { failed: 0, incomplete: 0, ignored: 0 };
+    for (const entry of entries) {
+        if (!['failed', 'incomplete'].includes(entry.state)) continue;
+        if (!activeInterfaces.has(entry.interface_name)) {
+            result.ignored += 1;
+            continue;
+        }
+        result[entry.state] += 1;
+    }
+    return result;
+}
+
 function analyzeEdgeSnapshot(snapshot, env = {}) {
     const findings = [];
     let severity = 'ok';
@@ -3660,12 +3949,14 @@ function analyzeEdgeSnapshot(snapshot, env = {}) {
         });
     }
 
-    const failedNeighbors = Number(snapshot.network?.neighbors?.state_counts?.failed || 0);
-    const incompleteNeighbors = Number(snapshot.network?.neighbors?.state_counts?.incomplete || 0);
+    const neighborIssues = actionableNeighborIssues(snapshot);
+    const failedNeighbors = neighborIssues.failed;
+    const incompleteNeighbors = neighborIssues.incomplete;
     if (failedNeighbors + incompleteNeighbors > 0) {
         addFinding('warn', 'arp neighbor issues', `failed=${failedNeighbors}, incomplete=${incompleteNeighbors}`, {
             failed_neighbors: failedNeighbors,
-            incomplete_neighbors: incompleteNeighbors
+            incomplete_neighbors: incompleteNeighbors,
+            ignored_inactive_interface_neighbors: neighborIssues.ignored
         });
     }
 
@@ -3819,6 +4110,13 @@ async function pollAndPostPulseLocalStatus(env, report) {
     if (!parseBoolean(env.PULSE_LOCAL_POLL_ENABLED, false)) {
         return null;
     }
+    if (!pulseHostMatchesPrimarySubnet(env)) {
+        console.warn(
+            `[nms-collector] Pulse local polling skipped: host=${String(env.PULSE_LOCAL_HOST || '').trim() || 'missing'}`
+            + ' is outside the current primary subnet'
+        );
+        return null;
+    }
 
     const observedAt = new Date().toISOString();
     const statusPayload = await fetchPulseLocalStatus(env);
@@ -3888,7 +4186,7 @@ async function runEdgeAnalysisHeartbeat(env) {
     }
 
     const analysis = await buildEdgeAnalysis(env);
-    const payload = buildHeartbeatPayload(env);
+    const payload = await attachPublicIpObservation(buildHeartbeatPayload(env), env);
     payload.status = analysis.deterministic?.severity === 'danger' ? 'error' : payload.status;
     payload.software_version = payload.software_version || EDGE_COLLECTOR_VERSION;
     payload.metadata.edge_analysis = compactEdgeAnalysisForHeartbeat(analysis);
@@ -3947,7 +4245,7 @@ async function runHeartbeat(env) {
     let heartbeatError = null;
 
     try {
-        const payload = buildHeartbeatPayload(env);
+        const payload = await attachPublicIpObservation(buildHeartbeatPayload(env), env);
         await postCollectorHeartbeat(env, report, payload);
     } catch (error) {
         heartbeatError = error;
@@ -4259,6 +4557,12 @@ async function main(argv = process.argv.slice(2), env = null) {
         throw new Error('offline-measurements action must be list or flush');
     }
 
+    if (command === 'upload-pcap') {
+        const result = await uploadPacketCaptureSummary(effectiveEnv, argv[1]);
+        process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        return;
+    }
+
     if (command === 'edge-analysis-heartbeat') {
         await runEdgeAnalysisHeartbeat(effectiveEnv);
         return;
@@ -4289,8 +4593,11 @@ if (require.main === module) {
 
 module.exports = {
     analyzeEdgeSnapshot,
+    analyzeExistingPacketCapture,
     aggregateMeasurementMetric,
     buildSwitchTopology,
+    collectSnmpTarget,
+    derivePhysicalPort,
     buildConnectivityAssessment,
     buildEdgeAnalysis,
     buildDiagnosticResultExcerpt,
@@ -4312,7 +4619,11 @@ module.exports = {
     inspectCollectorEnv,
     inspectLocalServices,
     isAllowedDiagnosticHost,
+    isIpv4InSubnet,
     isPrivateIpv4Address,
+    isPublicIpv4Address,
+    collectPublicIpv4,
+    attachPublicIpObservation,
     loadCollectorEnv,
     main,
     parseDfOutput,
@@ -4341,5 +4652,7 @@ module.exports = {
     runMeasurementSessionDiagnostic,
     fetchPulseLocalStatus,
     pollAndPostPulseLocalStatus,
-    summarizePingStep
+    pulseHostMatchesPrimarySubnet,
+    summarizePingStep,
+    uploadPacketCaptureSummary
 };

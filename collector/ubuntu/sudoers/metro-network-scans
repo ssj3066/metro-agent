@@ -1,0 +1,2 @@
+metro-agent ALL=(root) NOPASSWD: /opt/nms-collector/nms-gui-operations.sh arp-scan-all
+metro-agent ALL=(root) NOPASSWD: /opt/nms-collector/nms-gui-operations.sh wireless-scan

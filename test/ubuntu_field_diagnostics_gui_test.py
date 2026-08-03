@@ -123,6 +123,9 @@ class GuiSourceTest(unittest.TestCase):
         helper = (PATH.parent / "nms-gui-operations.sh").read_text(encoding="utf-8")
         for profile in ("basic)", "dns)", "dhcp)", "arp)", "icmp)", "lldp)"):
             self.assertIn(profile, helper)
+        self.assertIn("arp-scan-all)", helper)
+        self.assertIn("arp_scan_interfaces()", helper)
+        self.assertIn("no suitable broadcast-capable IPv4 interfaces found", helper)
         self.assertIn("duration >= 5 && duration <= 120", helper)
         self.assertIn("-c 5000", helper)
         self.assertIn("live-capture)", helper)
@@ -153,7 +156,7 @@ class GuiSourceTest(unittest.TestCase):
         helper = (PATH.parent / "nms-gui-operations.sh").read_text(encoding="utf-8")
         scanner = (PATH.parent / "nms-wireless-scan.py").read_text(encoding="utf-8")
         self.assertIn('self._new_page("무선 분석")', source)
-        self.assertIn('[GUI_OPS,"wireless-scan"]', source)
+        self.assertIn('["sudo","-n",GUI_OPS,"wireless-scan"]', source)
         self.assertIn('wireless-scan)', helper)
         self.assertIn('nms-wireless-scan.py', helper)
         self.assertIn("usb_wireless_adapters", scanner)
@@ -256,6 +259,21 @@ class GuiSourceTest(unittest.TestCase):
         self.assertIn("duration >= 10 && duration <= 28800", control)
         self.assertIn("interval >= 2 && interval <= 300", control)
         self.assertIn("invalid measurement modules", control)
+        self.assertIn("self.field_profile_confirmed = False", source)
+        self.assertIn("def _confirm_selected_field_profile", source)
+        self.assertIn("def _reset_site_measurement_view", source)
+        self.assertIn("새 현장 · 테스트 안 됨", source)
+        self.assertIn("이전 현장 데이터 혼입을 막기 위해", source)
+
+    def test_gui_privileged_operations_do_not_open_authentication_dialogs(self):
+        source = PATH.read_text(encoding="utf-8")
+        self.assertNotIn('"pkexec"', source)
+        self.assertIn('self.async_run(label,["sudo","-n",*cmd]', source)
+        sudoers = (PATH.parent / "sudoers/metro-gui-operations").read_text(encoding="utf-8")
+        self.assertIn(
+            "NOPASSWD: /opt/nms-collector/nms-gui-operations.sh *",
+            sudoers,
+        )
 
     def test_metro_sidebar_and_unified_snapshot_actions_are_present(self):
         source = PATH.read_text(encoding="utf-8")
@@ -283,9 +301,21 @@ class GuiSourceTest(unittest.TestCase):
         self.assertIn('"플러딩 분석": "flood"', source)
         self.assertIn("self.live_flood_status", source)
         self.assertIn("summarize_counts(self.live_flood_counts", source)
+        self.assertIn('["sudo","-n",GUI_OPS,"arp-scan-all"]', source)
+        network_scan_sudoers = (
+            PATH.parent / "sudoers/metro-network-scans"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "NOPASSWD: /opt/nms-collector/nms-gui-operations.sh arp-scan-all",
+            network_scan_sudoers,
+        )
+        self.assertIn(
+            "NOPASSWD: /opt/nms-collector/nms-gui-operations.sh wireless-scan",
+            network_scan_sudoers,
+        )
         self.assertIn('def stop_live_capture(self):', source)
         self.assertIn('def _stop_live_capture_worker(self, process):', source)
-        self.assertIn('["pkexec",GUI_OPS,"stop-live-capture",str(process.pid)]', source)
+        self.assertIn('["sudo","-n",GUI_OPS,"stop-live-capture",str(process.pid)]', source)
         self.assertIn('def _finish_close(self):', source)
         self.assertIn('"--probe"', source)
         self.assertIn('"--lock-timeout","30"', source)
@@ -324,5 +354,29 @@ class GuiSourceTest(unittest.TestCase):
         self.assertIn("DEFAULT_VPN_URL", client)
         self.assertIn("DEFAULT_HTTPS_URL", client)
         self.assertIn('"offline_queue"', client)
+
+    def test_all_gui_root_operations_use_passwordless_bounded_helpers(self):
+        source = PATH.read_text(encoding="utf-8")
+        helper = (PATH.parent / "nms-gui-operations.sh").read_text(encoding="utf-8")
+        sudoers = (PATH.parent / "sudoers/metro-gui-operations").read_text(encoding="utf-8")
+        self.assertIn("NOPASSWD: /opt/nms-collector/nms-gui-operations.sh *", sudoers)
+        for action in (
+            "edge-analysis",
+            "snapshot-session",
+            "snmp",
+            "service-restart",
+            "offline-list",
+            "offline-flush",
+            "arp-scan-all",
+            "wireless-scan",
+            "capture",
+            "live-capture",
+            "vpn-import",
+        ):
+            self.assertIn(f"  {action})", helper)
+        self.assertNotIn('self.privileged([NODE,COLLECTOR', source)
+        self.assertNotIn('self.privileged([HELPER', source)
+        self.assertNotIn('self.privileged(["/bin/systemctl"', source)
+        self.assertNotIn("GUI_OPERATIONS", source)
 
 if __name__ == "__main__": unittest.main()

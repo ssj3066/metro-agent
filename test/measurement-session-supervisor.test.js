@@ -6,19 +6,32 @@ const path = require('path');
 
 const {
     classifyClockState,
+    assessServerClock,
     controlSignals,
+    deleteSessionArchive,
     interruptedModuleResult,
     normalizeModuleSelection,
     parseChronyTracking,
     parseOptions,
     requiredRfBands,
     readActiveState,
+    readSessionArchive,
+    listSessionArchives,
     sessionStatus,
     statePaths,
     writeSessionState
 } = require('../collector/ubuntu/nms-measurement-session');
 
 const SESSION_ID = '2bb9b1a0-8322-4d4c-8781-c78d5654a366';
+
+test('measurement session transport supports a pinned NMS CA', () => {
+    const source = fs.readFileSync(
+        path.join(__dirname, '../collector/ubuntu/nms-measurement-session.js'),
+        'utf8'
+    );
+    assert.match(source, /NMS_CA_CERT_PATH/);
+    assert.match(source, /options\.ca = fs\.readFileSync/);
+});
 
 test('measurement supervisor enables bounded module selection', () => {
     assert.deepEqual(
@@ -54,6 +67,19 @@ test('measurement supervisor classifies NTP offset without inventing synchroniza
     assert.equal(classifyClockState('yes', 5001), 'unsynced');
     assert.equal(classifyClockState('no', 0), 'unsynced');
     assert.equal(classifyClockState('', null), 'unknown');
+});
+
+test('server clock assessment accounts for request round trip uncertainty', () => {
+    assert.deepEqual(assessServerClock(7507, 15000, 1000), {
+        state: 'synced',
+        reliable_delta_ms: 7,
+        uncertainty_ms: 7500
+    });
+    assert.deepEqual(assessServerClock(2500, 200, 1000), {
+        state: 'unsynced',
+        reliable_delta_ms: 2400,
+        uncertainty_ms: 100
+    });
 });
 
 test('measurement supervisor parses CLI options without consuming flags', () => {
@@ -124,4 +150,39 @@ test('measurement supervisor atomically tracks active and terminal state', (cont
     const terminal = sessionStatus({ MEASUREMENT_SESSION_STATE_DIR: root });
     assert.equal(terminal.status, 'completed');
     assert.equal(terminal.active, false);
+});
+
+test('measurement supervisor lists, reads, and deletes terminal local archives', (context) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'metro-measurement-archive-'));
+    context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const env = { MEASUREMENT_SESSION_STATE_DIR: root };
+    const state = {
+        measurement_session_id: SESSION_ID,
+        status: 'completed',
+        worker_pid: 999999,
+        created_at: '2026-08-03T01:00:00Z',
+        field_profile: {
+            customer_id: 7,
+            customer_name: '테스트 고객',
+            site_id: 9,
+            site_name: '테스트 현장'
+        }
+    };
+    writeSessionState(statePaths(env), state);
+    assert.equal(listSessionArchives(env)[0].site_name, '테스트 현장');
+    assert.equal(readSessionArchive(env, SESSION_ID).status, 'completed');
+    assert.equal(deleteSessionArchive(env, SESSION_ID).local_only, true);
+    assert.deepEqual(listSessionArchives(env), []);
+});
+
+test('measurement supervisor refuses to delete an active local archive', (context) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'metro-measurement-active-'));
+    context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const env = { MEASUREMENT_SESSION_STATE_DIR: root };
+    writeSessionState(statePaths(env), {
+        measurement_session_id: SESSION_ID,
+        status: 'running',
+        worker_pid: process.pid
+    });
+    assert.throws(() => deleteSessionArchive(env, SESSION_ID), /active measurement session/);
 });

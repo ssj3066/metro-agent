@@ -28,7 +28,8 @@ for file in \
   "${SCRIPT_DIR}/systemd/nms-collector-autostart.service" \
   "${SCRIPT_DIR}/systemd/nms-collector-heartbeat.service" \
   "${SCRIPT_DIR}/systemd/nms-collector-heartbeat.timer" \
-  "${SCRIPT_DIR}/systemd/nms-collector-edge-analysis.timer"; do
+  "${SCRIPT_DIR}/systemd/nms-collector-edge-analysis.timer" \
+  "${SCRIPT_DIR}/systemd/networkmanager-wait-online-override.conf"; do
   require_file "$file"
 done
 
@@ -47,6 +48,11 @@ if [[ "$CLEAR_PRIVATE_IP" == "true" && -f /etc/nms-collector/collector.env ]]; t
   sed -i -E 's/^COLLECTOR_PRIVATE_IP_OVERRIDE=.*/COLLECTOR_PRIVATE_IP_OVERRIDE=false/' /etc/nms-collector/collector.env
   echo "cleared static private IP override; backup: $backup"
 fi
+
+install -d -m 755 /etc/systemd/system/NetworkManager-wait-online.service.d
+install -m 644 \
+  "${SCRIPT_DIR}/systemd/networkmanager-wait-online-override.conf" \
+  /etc/systemd/system/NetworkManager-wait-online.service.d/override.conf
 
 systemctl daemon-reload
 systemctl enable NetworkManager-wait-online.service 2>/dev/null || true

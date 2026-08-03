@@ -20,9 +20,17 @@ test('Ubuntu collector has boot and network-change recovery assets', () => {
     assert.match(installer, /90-nms-collector-network-change/);
     assert.match(installer, /nms-collector-autostart\.service/);
     assert.match(installer, /NetworkManager-wait-online\.service/);
+    assert.match(installer, /networkmanager-wait-online-override\.conf/);
+    const waitOverride = read('collector/ubuntu/systemd/networkmanager-wait-online-override.conf');
+    assert.match(waitOverride, /nm-online .*--quiet .*--timeout=30/);
+    assert.doesNotMatch(waitOverride, /--any|--wait-for-startup/);
     assert.match(bootstrap, /nms-collector-heartbeat\.timer/);
     assert.match(bootstrap, /nms-collector-diagnostic-worker\.service/);
     assert.match(dispatcher, /dhcp4-change/);
+    assert.match(dispatcher, /WIREGUARD_INTERFACE/);
+    assert.match(dispatcher, /REMOTE_MANAGEMENT_MODE=omada_vpn/);
+    assert.match(dispatcher, /wg-quick@\$\{wireguard_interface\}\.service/);
+    assert.match(dispatcher, /systemctl is-active --quiet/);
     assert.match(dispatcher, /nms-collector-heartbeat\.service/);
     assert.match(unit, /After=network-online\.target/);
     assert.match(unit, /Restart=on-failure/);

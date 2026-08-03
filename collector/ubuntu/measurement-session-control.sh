@@ -15,6 +15,15 @@ case "$action" in
     [[ "$#" -eq 1 ]] || { echo "unexpected measurement session arguments" >&2; exit 2; }
     exec "$NODE" "$SUPERVISOR" "$action"
     ;;
+  list)
+    [[ "$#" -eq 1 ]] || { echo "unexpected measurement session arguments" >&2; exit 2; }
+    exec "$NODE" "$SUPERVISOR" list
+    ;;
+  show|delete)
+    [[ "$#" -eq 2 && "${2:-}" =~ ^[0-9a-fA-F-]{36}$ ]] \
+      || { echo "a valid session UUID is required" >&2; exit 2; }
+    exec "$NODE" "$SUPERVISOR" "$action" --session-id "$2"
+    ;;
   start)
     shift
     duration=""
@@ -46,7 +55,7 @@ case "$action" in
       --modules "$modules"
     ;;
   *)
-    echo "usage: $0 start|status|pause|resume|stop" >&2
+    echo "usage: $0 start|status|pause|resume|stop|list|show|delete" >&2
     exit 2
     ;;
 esac

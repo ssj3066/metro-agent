@@ -20,6 +20,7 @@ const DEFAULT_ENV_FILE = '/etc/nms-collector/collector.env';
 const DEFAULT_STATE_ROOT = '/var/lib/nms-collector/measurement-sessions';
 const SESSION_SCHEMA_VERSION = 'metro-measurement-session-v1';
 const MODULE_TYPES = ['wired', 'wireless', 'rf', 'packet_capture', 'system'];
+const TERMINAL_SESSION_STATUSES = new Set(['completed', 'partial', 'failed', 'cancelled']);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 class MeasurementSessionRequestError extends Error {
@@ -217,6 +218,22 @@ async function buildPreflight(env, serverClockDeltaMs = null) {
     };
 }
 
+function assessServerClock(deltaMs, roundTripMs, correlationWindowMs) {
+    const delta = Number(deltaMs);
+    const roundTrip = Math.max(0, Number(roundTripMs) || 0);
+    const window = Math.max(100, Number(correlationWindowMs) || 1000);
+    if (!Number.isFinite(delta)) {
+        return { state: 'unknown', reliable_delta_ms: null, uncertainty_ms: null };
+    }
+    const uncertainty = roundTrip / 2;
+    const reliableDelta = Math.max(0, Math.abs(delta) - uncertainty);
+    return {
+        state: reliableDelta <= window ? 'synced' : 'unsynced',
+        reliable_delta_ms: Number(reliableDelta.toFixed(3)),
+        uncertainty_ms: Number(uncertainty.toFixed(3))
+    };
+}
+
 function requestJson(urlValue, method, payload, env) {
     const target = new URL(urlValue);
     const body = payload === null || payload === undefined
@@ -238,8 +255,13 @@ function requestJson(urlValue, method, payload, env) {
         options.headers['Content-Type'] = 'application/json';
         options.headers['Content-Length'] = body.length;
     }
-    if (target.protocol === 'https:' && parseBoolean(env.NMS_INSECURE_TLS, false)) {
-        options.rejectUnauthorized = false;
+    if (target.protocol === 'https:') {
+        if (parseBoolean(env.NMS_INSECURE_TLS, false)) {
+            options.rejectUnauthorized = false;
+        } else {
+            const caPath = String(env.NMS_CA_CERT_PATH || '').trim();
+            if (caPath) options.ca = fs.readFileSync(caPath);
+        }
     }
     return new Promise((resolve, reject) => {
         const request = transport.request(options, (response) => {
@@ -426,11 +448,22 @@ async function startSession(env, options, fieldProfile) {
     };
     const requestStartedAt = Date.now();
     const created = await nmsRequest(env, 'POST', sessionApiPath(env), createPayload);
-    const requestMidpoint = requestStartedAt + ((Date.now() - requestStartedAt) / 2);
+    const requestFinishedAt = Date.now();
+    const requestRoundTripMs = requestFinishedAt - requestStartedAt;
+    const requestMidpoint = requestStartedAt + (requestRoundTripMs / 2);
     const serverClockDeltaMs = created.server_time
         ? Date.parse(created.server_time) - requestMidpoint
         : null;
     const preflight = await buildPreflight(env, serverClockDeltaMs);
+    const serverClock = assessServerClock(
+        serverClockDeltaMs,
+        requestRoundTripMs,
+        createPayload.correlation_window_ms
+    );
+    preflight.clock.server_round_trip_ms = requestRoundTripMs;
+    preflight.clock.server_clock_uncertainty_ms = serverClock.uncertainty_ms;
+    preflight.clock.server_clock_reliable_delta_ms = serverClock.reliable_delta_ms;
+    preflight.clock.server_clock_state = serverClock.state;
     await nmsRequest(
         env,
         'POST',
@@ -649,20 +682,13 @@ async function runWorker(env, sessionId) {
     await nmsRequest(env, 'PATCH', sessionApiPath(env, sessionId), { action: 'start' });
     writeSessionState(paths, state);
 
-    let signalFinalizing = false;
+    let stopRequested = false;
     const stopHandler = () => {
-        if (signalFinalizing) return;
-        signalFinalizing = true;
+        if (stopRequested) return;
+        stopRequested = true;
         state.status = 'stopping';
-        void finalizeWorker(env, paths, state, 'operator_stop')
-            .then(() => process.exit(0))
-            .catch((error) => {
-                state.status = 'failed';
-                state.error_code = 'stop_finalize_failed';
-                state.error_message = error.message;
-                writeSessionState(paths, state);
-                process.exit(1);
-            });
+        state.stopping_at ||= new Date().toISOString();
+        writeSessionState(paths, state);
     };
     process.on('SIGTERM', stopHandler);
     process.on('SIGINT', stopHandler);
@@ -693,20 +719,40 @@ async function runWorker(env, sessionId) {
                         measurementType,
                         moduleRun.module_run_id
                     ]
-                ))
+                )),
+                {
+                    shouldStop: () => stopRequested,
+                    onProgress: ({ rounds_completed: roundsCompleted, observed_at: observedAt }) => {
+                        for (const measurementType of ['wired', 'system']) {
+                            if (!state.modules[measurementType]) continue;
+                            state.module_runs[measurementType].sample_count = roundsCompleted;
+                            state.module_runs[measurementType].last_sample_at = observedAt;
+                        }
+                        writeSessionState(paths, state);
+                    }
+                }
             );
             const session = legacy.measurement_session || {};
             const sampleCount = Number(session.rounds_completed || 0);
             for (const measurementType of ['wired', 'system']) {
                 if (!state.modules[measurementType]) continue;
-                await postModuleRun(env, state, measurementType, 'completed', {
-                    sample_count: sampleCount
-                });
+                if (stopRequested) {
+                    const interrupted = interruptedModuleResult(
+                        'operator_stop',
+                        state.module_runs[measurementType],
+                        sampleCount
+                    );
+                    await postModuleRun(env, state, measurementType, interrupted.status, interrupted);
+                } else {
+                    await postModuleRun(env, state, measurementType, 'completed', {
+                        sample_count: sampleCount
+                    });
+                }
             }
         } else {
             await new Promise((resolve) => setTimeout(resolve, state.duration_seconds * 1000));
         }
-        await finalizeWorker(env, paths, state);
+        await finalizeWorker(env, paths, state, stopRequested ? 'operator_stop' : 'natural_completion');
     } catch (error) {
         for (const measurementType of ['wired', 'system']) {
             if (!state.modules[measurementType]) continue;
@@ -766,6 +812,65 @@ function sessionStatus(env) {
     };
 }
 
+function listSessionArchives(env) {
+    const paths = statePaths(env);
+    if (!fs.existsSync(paths.sessions)) return [];
+    return fs.readdirSync(paths.sessions, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && UUID_PATTERN.test(entry.name))
+        .map((entry) => readJson(sessionFile(paths, entry.name)))
+        .filter(Boolean)
+        .map((state) => ({
+            measurement_session_id: state.measurement_session_id,
+            status: state.status || 'unknown',
+            customer_id: state.field_profile?.customer_id || null,
+            customer_name: state.field_profile?.customer_name || null,
+            site_id: state.field_profile?.site_id || null,
+            site_name: state.field_profile?.site_name || null,
+            created_at: state.created_at || null,
+            started_at: state.started_at || null,
+            ended_at: state.ended_at || null,
+            duration_seconds: state.duration_seconds || null,
+            modules: state.modules || {},
+            active: !TERMINAL_SESSION_STATUSES.has(state.status) && processAlive(state.worker_pid)
+        }))
+        .sort((a, b) => String(b.started_at || b.created_at || '')
+            .localeCompare(String(a.started_at || a.created_at || '')));
+}
+
+function readSessionArchive(env, sessionIdValue) {
+    const sessionId = String(sessionIdValue || '').trim().toLowerCase();
+    if (!UUID_PATTERN.test(sessionId)) throw new Error('session id must be a UUID');
+    const state = readJson(sessionFile(statePaths(env), sessionId));
+    if (!state) throw new Error(`measurement session archive not found: ${sessionId}`);
+    return state;
+}
+
+function deleteSessionArchive(env, sessionIdValue) {
+    const paths = statePaths(env);
+    const state = readSessionArchive(env, sessionIdValue);
+    if (!TERMINAL_SESSION_STATUSES.has(state.status) || processAlive(state.worker_pid)) {
+        throw new Error('active measurement session archive cannot be deleted');
+    }
+    fs.rmSync(path.dirname(sessionFile(paths, state.measurement_session_id)), {
+        recursive: true,
+        force: false
+    });
+    const last = readJson(paths.last);
+    if (last?.measurement_session_id === state.measurement_session_id) {
+        const replacement = listSessionArchives(env)[0] || null;
+        if (replacement) {
+            writeJsonAtomically(paths.last, readSessionArchive(env, replacement.measurement_session_id));
+        } else if (fs.existsSync(paths.last)) {
+            fs.unlinkSync(paths.last);
+        }
+    }
+    return {
+        deleted: true,
+        measurement_session_id: state.measurement_session_id,
+        local_only: true
+    };
+}
+
 async function main(argv = process.argv.slice(2)) {
     const command = argv[0] || 'status';
     const options = parseOptions(argv.slice(1));
@@ -788,7 +893,19 @@ async function main(argv = process.argv.slice(2)) {
         console.log(JSON.stringify(sessionStatus(env), null, 2));
         return;
     }
-    throw new Error('usage: nms-measurement-session.js [start|status|pause|resume|stop|worker]');
+    if (command === 'list') {
+        console.log(JSON.stringify({ sessions: listSessionArchives(env) }, null, 2));
+        return;
+    }
+    if (command === 'show') {
+        console.log(JSON.stringify(readSessionArchive(env, options.session_id), null, 2));
+        return;
+    }
+    if (command === 'delete') {
+        console.log(JSON.stringify(deleteSessionArchive(env, options.session_id), null, 2));
+        return;
+    }
+    throw new Error('usage: nms-measurement-session.js [start|status|pause|resume|stop|list|show|delete|worker]');
 }
 
 if (require.main === module) {
@@ -803,7 +920,9 @@ module.exports = {
     buildPreflight,
     classifyClockState,
     controlSignals,
+    deleteSessionArchive,
     inspectClock,
+    assessServerClock,
     interruptedModuleResult,
     requiredRfBands,
     normalizeModuleSelection,
@@ -811,6 +930,8 @@ module.exports = {
     parseOptions,
     processAlive,
     readActiveState,
+    readSessionArchive,
+    listSessionArchives,
     sessionStatus,
     statePaths,
     writeJsonAtomically,

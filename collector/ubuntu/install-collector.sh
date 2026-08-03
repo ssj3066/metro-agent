@@ -68,6 +68,8 @@ install -m 755 "${SCRIPT_DIR}/install-wireless-adapter-support.sh" "${INSTALL_DI
 install -m 755 "${SCRIPT_DIR}/nms-wifi-analysis.js" "${INSTALL_DIR}/nms-wifi-analysis.js"
 install -m 755 "${SCRIPT_DIR}/nms-measurement-session.js" "${INSTALL_DIR}/nms-measurement-session.js"
 install -m 755 "${SCRIPT_DIR}/measurement-session-control.sh" "${INSTALL_DIR}/measurement-session-control.sh"
+install -m 755 "${SCRIPT_DIR}/deployment-monitoring-control.js" "${INSTALL_DIR}/deployment-monitoring-control.js"
+install -m 644 "${SCRIPT_DIR}/time-series-context.js" "${INSTALL_DIR}/time-series-context.js"
 install -m 755 "${SCRIPT_DIR}/nms-tinysa-sweep.py" "${INSTALL_DIR}/nms-tinysa-sweep.py"
 install -m 755 "${SCRIPT_DIR}/configure-tinysa.sh" "${INSTALL_DIR}/configure-tinysa.sh"
 install -d -m 755 "${INSTALL_DIR}/metro-agent-v1/lib" "${INSTALL_DIR}/metro-agent-v1/plugins"
@@ -88,6 +90,10 @@ install -m 644 "${SCRIPT_DIR}/ict_field_client.py" "/usr/local/lib/metro-nms-col
 install -m 644 "${SCRIPT_DIR}/metro-nms-field-diagnostics.desktop" "/usr/share/applications/metro-nms-field-diagnostics.desktop"
 install -m 440 "${SCRIPT_DIR}/sudoers/metro-tinysa" "/etc/sudoers.d/metro-tinysa"
 visudo -cf "/etc/sudoers.d/metro-tinysa"
+install -m 440 "${SCRIPT_DIR}/sudoers/metro-network-scans" "/etc/sudoers.d/metro-network-scans"
+visudo -cf "/etc/sudoers.d/metro-network-scans"
+install -m 440 "${SCRIPT_DIR}/sudoers/metro-gui-operations" "/etc/sudoers.d/metro-gui-operations"
+visudo -cf "/etc/sudoers.d/metro-gui-operations"
 rm -f "/etc/sudoers.d/metro-measurement-status"
 install -m 440 \
   "${SCRIPT_DIR}/sudoers/metro-measurement-control" \
@@ -149,7 +155,14 @@ install -m 644 "${SCRIPT_DIR}/systemd/nms-wifi-analysis.service" "${SYSTEMD_DIR}
 install -m 644 "${SCRIPT_DIR}/systemd/nms-metro-agent-v1.service" "${SYSTEMD_DIR}/nms-metro-agent-v1.service"
 install -m 644 "${SCRIPT_DIR}/systemd/nms-metro-agent-v1.timer" "${SYSTEMD_DIR}/nms-metro-agent-v1.timer"
 install -d -m 700 /var/lib/nms-collector/wifi-analysis /var/lib/nms-collector/wifi-analysis/queue
-install -d -m 750 /var/lib/nms-collector/measurement-sessions /var/lib/nms-collector/measurement-sessions/sessions
+install -d -m 750 \
+  /var/lib/nms-collector/measurement-sessions \
+  /var/lib/nms-collector/measurement-sessions/sessions \
+  /var/lib/nms-collector/deployment-monitoring
+install -d -m 755 /etc/systemd/system/NetworkManager-wait-online.service.d
+install -m 644 \
+  "${SCRIPT_DIR}/systemd/networkmanager-wait-online-override.conf" \
+  /etc/systemd/system/NetworkManager-wait-online.service.d/override.conf
 
 for required_runtime in \
   "${INSTALL_DIR}/nms-collector.js" \

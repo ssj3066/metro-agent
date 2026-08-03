@@ -17,6 +17,9 @@ const {
     collectPrimaryNetwork,
     collectLldpSnapshot,
     collectWireGuardStatus,
+    collectPublicIpv4,
+    collectSnmpTarget,
+    derivePhysicalPort,
     getTcpdumpFilter,
     getRemoteManagementSettings,
     inferCollectorRole,
@@ -24,12 +27,14 @@ const {
     inspectLocalServices,
     isAllowedDiagnosticHost,
     isPrivateIpv4Address,
+    isPublicIpv4Address,
     parseEnvFileContents,
     parseDfOutput,
     parseIpNeighborSummary,
     parseTsharkDetailRows,
     parseTsharkPacketRows,
     parsePulseLocalStatusResponse,
+    pulseHostMatchesPrimarySubnet,
     parseSnmpOidTable,
     parseTcpTarget,
     normalizeFieldMeasurementProfile,
@@ -317,6 +322,26 @@ test('buildPulseLocalStatusPayload records source timestamp and normalized value
     assert.equal(payload.source_measurement_at, '2026-07-20T10:00:00.000Z');
 });
 
+test('portable collector rejects a stale Pulse address from the previous site subnet', () => {
+    const primaryNetwork = {
+        address: '192.168.0.48',
+        prefixlen: 24,
+        subnet: '192.168.0.0/24'
+    };
+    assert.equal(pulseHostMatchesPrimarySubnet({
+        PULSE_LOCAL_HOST: '192.168.0.105',
+        PULSE_LOCAL_REQUIRE_PRIMARY_SUBNET: 'true'
+    }, primaryNetwork), true);
+    assert.equal(pulseHostMatchesPrimarySubnet({
+        PULSE_LOCAL_HOST: '192.168.1.129',
+        PULSE_LOCAL_REQUIRE_PRIMARY_SUBNET: 'true'
+    }, primaryNetwork), false);
+    assert.equal(pulseHostMatchesPrimarySubnet({
+        PULSE_LOCAL_HOST: '192.168.1.129',
+        PULSE_LOCAL_REQUIRE_PRIMARY_SUBNET: 'false'
+    }, primaryNetwork), true);
+});
+
 test('parseSnmpOidTable preserves multi-index suffixes', () => {
     const rows = parseSnmpOidTable('SNMPv2-SMI::mib-2.17.7.1.2.2.1.2.10.0.17.34.51.68.85 = INTEGER: 7\n', '1.3.6.1.2.1.17.7.1.2.2.1.2');
     assert.equal(rows.length, 0, 'symbolic OIDs are intentionally ignored');
@@ -349,6 +374,39 @@ test('buildSwitchTopology normalizes VLAN membership FDB LLDP STP and PoE', () =
     assert.equal(topology.fdb[0].if_index, 102);
     assert.equal(topology.lldp_neighbors[0].system_name, 'access-sw');
     assert.equal(topology.poe_ports[0].admin_enabled, true);
+});
+
+test('SNMP interface normalization prefers 64-bit counters and physical port names', () => {
+    const outputs = {
+        '1.3.6.1.2.1.1.5.0': '.1.3.6.1.2.1.1.5.0 = STRING: omada-core\n',
+        '1.3.6.1.2.1.31.1.1.1.1': '.1.3.6.1.2.1.31.1.1.1.1.1 = STRING: gigabitEthernet 1/0/1\n',
+        '1.3.6.1.2.1.2.2.1.2': '.1.3.6.1.2.1.2.2.1.2.1 = STRING: gigabitEthernet 1/0/1\n',
+        '1.3.6.1.2.1.2.2.1.5': '.1.3.6.1.2.1.2.2.1.5.1 = Gauge32: 1000000000\n',
+        '1.3.6.1.2.1.31.1.1.1.15': '.1.3.6.1.2.1.31.1.1.1.15.1 = Gauge32: 1000\n',
+        '1.3.6.1.2.1.2.2.1.10': '.1.3.6.1.2.1.2.2.1.10.1 = Counter32: 100\n',
+        '1.3.6.1.2.1.31.1.1.1.6': '.1.3.6.1.2.1.31.1.1.1.6.1 = Counter64: 4294967396\n',
+        '1.3.6.1.2.1.2.2.1.16': '.1.3.6.1.2.1.2.2.1.16.1 = Counter32: 200\n',
+        '1.3.6.1.2.1.31.1.1.1.10': '.1.3.6.1.2.1.31.1.1.1.10.1 = Counter64: 4294967496\n',
+        '1.3.6.1.2.1.2.2.1.7': '.1.3.6.1.2.1.2.2.1.7.1 = INTEGER: 1\n',
+        '1.3.6.1.2.1.2.2.1.8': '.1.3.6.1.2.1.2.2.1.8.1 = INTEGER: 1\n',
+        '1.3.6.1.2.1.17.1.4.1.2': '.1.3.6.1.2.1.17.1.4.1.2.49153 = INTEGER: 1\n'
+    };
+    const target = { index: 1, name: 'Omada', role: 'switch', host: '10.0.0.2', port: 161, version: '2c', community: 'test', timeout_seconds: 1, retries: 0 };
+    const result = collectSnmpTarget(target, (_command, args) => outputs[args.at(-1)] || '');
+    const port = result.interfaces[0];
+    assert.equal(port.counter_bits, 64);
+    assert.equal(port.in_octets, 4294967396);
+    assert.equal(port.in_octets_32, 100);
+    assert.equal(port.speed_bps, 1000000000);
+    assert.equal(port.bridge_base_port, 49153);
+    assert.equal(port.physical_port, 1);
+    assert.equal(port.base_port, 1);
+});
+
+test('physical port parsing rejects ambiguous interface labels', () => {
+    assert.equal(derivePhysicalPort({ name: 'gigabitEthernet 1/0/24' }), 24);
+    assert.equal(derivePhysicalPort({ descr: 'Port 7' }), 7);
+    assert.equal(derivePhysicalPort({ name: 'loopback0' }), null);
 });
 
 test('parseEnvFileContents keeps existing values and parses quoted assignments', () => {
@@ -524,6 +582,38 @@ test('mobile collectors prefer the active route address over a stale configured 
     assert.equal(payload.private_ip, '192.168.11.130');
 });
 
+test('public IP collection rejects private addresses and accepts a fallback public address', async () => {
+    const calls = [];
+    const observation = await collectPublicIpv4({
+        PUBLIC_IP_ENDPOINTS: 'https://first.example/ip,https://second.example/ip',
+        PUBLIC_IP_TIMEOUT_MS: '1200'
+    }, async (endpoint, timeoutMs) => {
+        calls.push([endpoint, timeoutMs]);
+        return endpoint.includes('first') ? '10.0.2.130' : '{"ip":"198.51.100.20"}';
+    });
+
+    assert.equal(isPublicIpv4Address('10.0.2.130'), false);
+    assert.equal(isPublicIpv4Address('192.168.100.239'), false);
+    assert.equal(isPublicIpv4Address('198.51.100.20'), true);
+    assert.equal(observation.value, '198.51.100.20');
+    assert.equal(observation.status, 'collected');
+    assert.equal(observation.source, 'second.example');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0][1], 1200);
+});
+
+test('public IP collection reports unavailable without inventing a value', async () => {
+    const observation = await collectPublicIpv4({
+        PUBLIC_IP_ENDPOINTS: 'https://first.example/ip'
+    }, async () => {
+        throw new Error('blocked');
+    });
+
+    assert.equal(observation.value, null);
+    assert.equal(observation.status, 'unavailable');
+    assert.equal(observation.error_count, 1);
+});
+
 test('primary network preserves the active interface IP prefix subnet and gateway', () => {
     const execFn = (_command, args) => {
         if (args.join(' ') === '-j -4 route get 1.1.1.1') {
@@ -679,6 +769,29 @@ test('connectivity assessment accepts dual domestic and overseas ping evidence',
     assert.equal(assessment.facts.internet_ping_google, true);
 });
 
+test('connectivity assessment does not report a high-latency local gateway as healthy', () => {
+    const assessment = buildConnectivityAssessment([
+        {
+            name: 'gateway-ping',
+            ok: true,
+            result: {
+                target: '192.168.100.254',
+                stdout: '4 packets transmitted, 4 received, 0% packet loss\nrtt min/avg/max/mdev = 46.021/70.408/119.727/19.198 ms'
+            }
+        },
+        { name: 'internet-ping-kt', ok: true },
+        { name: 'internet-ping-google', ok: true },
+        { name: 'dns-default', ok: true },
+        { name: 'internet-https', ok: true },
+        { name: 'nms-tcp', ok: true }
+    ]);
+
+    assert.equal(assessment.state, 'local_gateway_degraded');
+    assert.equal(assessment.cause_label, 'gateway_router_wan');
+    assert.equal(assessment.facts.gateway_latency_ms, 70.408);
+    assert.match(assessment.summary, /70.408 ms/);
+});
+
 test('summarizePingStep preserves target and normalized latency metrics', () => {
     const summary = summarizePingStep({
         result: {
@@ -768,4 +881,40 @@ test('analyzeEdgeSnapshot reports disk memory gateway and arp findings', () => {
     assert.match(analysis.summary, /disk usage critical/);
     assert(analysis.findings.some((finding) => finding.title === 'default gateway missing'));
     assert(analysis.findings.some((finding) => finding.title === 'diagnostic tools missing'));
+});
+
+test('analyzeEdgeSnapshot ignores unresolved neighbors on inactive interfaces', () => {
+    const analysis = analyzeEdgeSnapshot({
+        cpu_count: 2,
+        loadavg: [0, 0, 0],
+        memory: { used_pct: 20 },
+        network: {
+            default_gateway: '192.168.100.254',
+            interfaces: [
+                {
+                    name: 'enp1s0',
+                    state: 'UP',
+                    addresses: [{ family: 'inet', address: '192.168.100.239', scope: 'global' }]
+                },
+                { name: 'wlx-test', state: 'DORMANT', addresses: [] }
+            ],
+            neighbors: {
+                state_counts: { incomplete: 2 },
+                entries: [
+                    { interface_name: 'wlx-test', state: 'incomplete' },
+                    { interface_name: 'wlx-test', state: 'incomplete' }
+                ]
+            }
+        },
+        disks: [],
+        tools: {
+            ping: true,
+            traceroute: true,
+            dig: true,
+            tcpdump: true,
+            ip: true,
+            snmpget: true
+        }
+    });
+    assert.equal(analysis.findings.some((finding) => finding.title === 'arp neighbor issues'), false);
 });

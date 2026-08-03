@@ -33,6 +33,13 @@ function requestJson(targetUrl, { method = 'GET', token, payload = null, timeout
     }
 
     return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(deadline);
+            callback(value);
+        };
         const request = transport.request(parsedUrl, {
             method,
             headers,
@@ -54,18 +61,22 @@ function requestJson(targetUrl, { method = 'GET', token, payload = null, timeout
                 try {
                     parsed = text ? JSON.parse(text) : {};
                 } catch {
-                    reject(new Error(`metro agent server returned invalid JSON (${response.statusCode})`));
+                    finish(reject, new Error(`metro agent server returned invalid JSON (${response.statusCode})`));
                     return;
                 }
                 if (response.statusCode < 200 || response.statusCode >= 300) {
-                    reject(new Error(`metro agent server returned ${response.statusCode}: ${parsed.detail || parsed.error || 'request failed'}`));
+                    finish(reject, new Error(`metro agent server returned ${response.statusCode}: ${parsed.detail || parsed.error || 'request failed'}`));
                     return;
                 }
-                resolve(parsed);
+                finish(resolve, parsed);
             });
         });
+        const deadline = setTimeout(
+            () => request.destroy(new Error('metro agent server request deadline exceeded')),
+            timeoutMs
+        );
         request.setTimeout(timeoutMs, () => request.destroy(new Error('metro agent server request timed out')));
-        request.on('error', reject);
+        request.on('error', (error) => finish(reject, error));
         if (body) request.write(body);
         request.end();
     });

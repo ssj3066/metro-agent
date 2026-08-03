@@ -38,7 +38,12 @@ function run(check, context = {}) {
                 duration_ms: durationMs,
                 source: 'tcp_connect',
                 error_code: errorCode,
-                details: { host: target.host, port: target.port }
+                details: {
+                    host: target.host,
+                    port: target.port,
+                    path_role: String(check.options?.path_role || '').trim() || null,
+                    required: check.options?.required !== false
+                }
             }]);
         };
         const socket = connect({ host: target.host, port: target.port });
